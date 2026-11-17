@@ -5,6 +5,14 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 
 class StarterLibraryTest(unittest.TestCase):
+    def test_newer_catalog_explains_update_and_invalid_catalog_stays_distinct(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            with self.assertRaisesRegex(reader.LibraryError, 'Please update your device'):
+                app._validate_catalog({'schema': 2, 'books': []})
+            with self.assertRaisesRegex(reader.LibraryError, 'Invalid starter catalog'):
+                app._validate_catalog({'books': []})
+
     def setup_modules(self, tmp):
         root=Path(tmp); files={}; registered=[]
         class Error(Exception): pass
@@ -68,9 +76,12 @@ class StarterLibraryTest(unittest.TestCase):
             files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload,'pg1.pri':index})
             self.assertEqual(app.load_catalog(),[]);self.assertEqual(asyncio.run(app.refresh()),[])
             app.set_enabled(True);self.assertEqual(asyncio.run(app.refresh()),[item])
-            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}): path=asyncio.run(app.download(item))
+            progress=[]
+            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):
+                path=asyncio.run(app.download(item, progress=lambda received,total:progress.append((received,total))))
             self.assertEqual(Path(path).read_bytes(),payload);self.assertEqual(Path(reader.BOOK_DIR,'pg1.pri').read_bytes(),index)
             self.assertEqual(registered,[(item['id'],sha)])
+            self.assertEqual(progress[-1],(len(index)+len(payload),len(index)+len(payload)))
             app.set_enabled(False);self.assertEqual(app.load_catalog(),[]);self.assertEqual(Path(path).read_bytes(),payload)
 
     def test_transfer_yields_so_light_animation_can_advance(self):
@@ -149,7 +160,7 @@ class StarterLibraryTest(unittest.TestCase):
             app.set_enabled(True)
             async def run():
                 started=asyncio.Event()
-                async def partial(name,temporary,size,sha):
+                async def partial(name,temporary,size,sha,progress=None,offset=0,total_size=None):
                     Path(temporary).write_bytes(b'partial')
                     started.set()
                     await asyncio.Event().wait()
@@ -172,5 +183,14 @@ class StarterLibraryTest(unittest.TestCase):
             app._catalog_bytes=unavailable
             with self.assertRaises(reader.LibraryError): asyncio.run(app.refresh())
             self.assertEqual(app.load_catalog(),[])
+
+    def test_empty_timeout_reports_why_catalog_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            app.set_enabled(True)
+            async def timeout(): raise TimeoutError()
+            app._catalog_bytes = timeout
+            with self.assertRaisesRegex(reader.LibraryError, 'Connection timed out'):
+                asyncio.run(app.refresh())
 
 if __name__=='__main__': unittest.main()

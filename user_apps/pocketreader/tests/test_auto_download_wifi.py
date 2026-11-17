@@ -17,7 +17,7 @@ class AutoDownloadWifiTest(unittest.IsolatedAsyncioTestCase):
         async def connect(ssid, duration, callback, remember=True):
             events.append(('connect', ssid, duration, remember))
             if failure == 'connect': raise OSError('connection failed')
-        async def download(entry):
+        async def download(entry, progress=None):
             events.append(('download', entry['id']))
             if failure == 'download': raise OSError('download failed')
         wifi = types.SimpleNamespace(radio_status=lambda:(radio,connected), preferred_ssid=lambda:preferred,
@@ -30,6 +30,7 @@ class AutoDownloadWifiTest(unittest.IsolatedAsyncioTestCase):
         scope={'wifi_setup':wifi,'starter_library':starter,'book_library':types.SimpleNamespace(LibraryError=LibraryError),'aio':aio}
         exec(compile(code,str(PATH),'exec'),scope)
         app=scope['App'](); app._wifi_task=None; app._dirty=False
+        app._show_download_progress=lambda received,total: None
         app.reader_display=types.SimpleNamespace(ready=lambda:True)
         app._draw=lambda:events.append(('display',app.update_status))
         app._update_wifi_indicator=lambda:None

@@ -23,7 +23,7 @@ class RefreshWifi(unittest.IsolatedAsyncioTestCase):
         wifi.connect_saved=connect
         async def refresh():
             events.append('refresh')
-            if failure=='refresh':raise Error('catalog failed')
+            if failure=='refresh':raise Error('Starter library unavailable: catalog failed')
         starter=types.SimpleNamespace(enabled=lambda:True,refresh=refresh)
         aio=types.SimpleNamespace(sleep_ms=lambda _:asyncio.sleep(0))
         scope={'wifi_setup':wifi,'starter_library':starter,'book_library':types.SimpleNamespace(LibraryError=Error),'aio':aio}
@@ -39,7 +39,7 @@ class RefreshWifi(unittest.IsolatedAsyncioTestCase):
 
     async def test_offline_refresh_connects_and_turns_off(self):
         events,app=await self.run_case(False)
-        self.assertEqual(events,['begin',('display','CONNECTING last network'),('connect','last network',False),'refresh','load',('off',False),'end'])
+        self.assertEqual(events,['begin',('display','REFRESHING LIBRARY'),('display','CONNECTING last network'),('connect','last network',False),'refresh','load',('off',False),'end'])
         self.assertEqual(app.update_status,'LIBRARY UPDATED')
 
     async def test_already_connected_remains_on(self):
@@ -53,5 +53,9 @@ class RefreshWifi(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('refresh',events)
         self.assertIn('load',events)
         self.assertIn('connection failed',app.update_status)
+
+    async def test_catalog_error_avoids_duplicate_unavailable_prefix(self):
+        events,app=await self.run_case(True,'refresh')
+        self.assertEqual(app.update_status, 'LIBRARY UNAVAILABLE: catalog failed')
 
 if __name__=='__main__':unittest.main()

@@ -43,7 +43,7 @@ def layout_lines(handle, data_offset, advances, position=None, body_end=None, he
             chunk = ""
             width = 0
             for character in word:
-                char_width = selected_advances[ord(character)-32] if 32 <= ord(character) <= 126 else selected_advances[31]
+                char_width = selected_advances[ord(character)-32] if 32 <= ord(character) <= 126 else selected_advances[95 + "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿāăēĕėīĭōŏŒœūŭſǽȳ˘̸ΑΓΔΕΛΜΝΞΠάέήίαβγδεζηθικλμνξοπρςστυφχψωόύώἀἁἄἅἐἔἠἡἦἰἱἷἸὀὁὄὐὑὔὡὦὰὲὴὶὸὺὼῆῇῖῥῦῳῶῷ‐–—‘’‛“”†‡•…′″⁄⅓⅛✠".find(character)] if character in "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿāăēĕėīĭōŏŒœūŭſǽȳ˘̸ΑΓΔΕΛΜΝΞΠάέήίαβγδεζηθικλμνξοπρςστυφχψωόύώἀἁἄἅἐἔἠἡἦἰἱἷἸὀὁὄὐὑὔὡὦὰὲὴὶὸὺὼῆῇῖῥῦῳῶῷ‐–—‘’‛“”†‡•…′″⁄⅓⅛✠" and 95 + "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿāăēĕėīĭōŏŒœūŭſǽȳ˘̸ΑΓΔΕΛΜΝΞΠάέήίαβγδεζηθικλμνξοπρςστυφχψωόύώἀἁἄἅἐἔἠἡἦἰἱἷἸὀὁὄὐὑὔὡὦὰὲὴὶὸὺὼῆῇῖῥῦῳῶῷ‐–—‘’‛“”†‡•…′″⁄⅓⅛✠".find(character) < len(selected_advances) else selected_advances[31]
                 if chunk and width + char_width > 608:
                     chunks.append((chunk, width))
                     chunk = ""

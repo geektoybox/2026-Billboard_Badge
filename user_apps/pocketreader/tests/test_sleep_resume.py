@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SleepResume(unittest.TestCase):
-    def test_wake_requires_two_seconds_and_short_press_returns_to_sleep(self):
+    def test_wake_requires_one_second_and_short_press_returns_to_sleep(self):
         for release_at in (None, 400):
             clock = {'ms': 0}; events = []
             fake_time = types.ModuleType('time')
@@ -33,7 +33,7 @@ class SleepResume(unittest.TestCase):
                 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
                 result = module.confirm_wake_hold()
             if release_at is None:
-                self.assertTrue(result); self.assertEqual(clock['ms'], 2000); self.assertEqual(events, [])
+                self.assertTrue(result); self.assertEqual(clock['ms'], 1000); self.assertEqual(events, [])
             else:
                 self.assertFalse(result); self.assertEqual(events, [('arm', 0), 'sleep'])
 

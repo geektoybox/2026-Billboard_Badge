@@ -111,7 +111,7 @@ def confirm_wake_hold():
 
     pin = machine.Pin(16, machine.Pin.IN, machine.Pin.PULL_UP)
     started = time.ticks_ms()
-    while time.ticks_diff(time.ticks_ms(), started) < 2000:
+    while time.ticks_diff(time.ticks_ms(), started) < 1000:
         if pin.value():
             # Do not re-arm a low-level wake while the button is bouncing.
             stable = time.ticks_ms()

@@ -28,7 +28,7 @@ installer and sample books still need an end-to-end test on a fresh badge.
 
 Use the app chooser to start PocketReader XL. Hold User A and User B together to
 open Settings, and use Wi-Fi to access the reader's local management page.
-In the Wi-Fi menu, **Starter Library** is optional and off by default. Turn it
+In **Library Settings**, **Starter Library** is optional and off by default. Turn it
 on and connect to a saved Wi-Fi network to browse the public books alongside
 your own. Select a title to download it; turning the option off hides the
 available online titles but keeps books already downloaded. No account is required.
@@ -61,6 +61,11 @@ pixels are shown as a black-and-white pattern that appears gray; the saved image
 is retained, so red returns when Quick Boot is disabled. Reinstalling the
 reader preserves an existing sleep image.
 
+Quick Boot skips the red-clearing refresh to start faster. A red tint can
+remain or become visible over time. If this happens, turn off Quick Boot and
+restart the reader to clear the display; you can turn Quick Boot back on
+afterward.
+
 ## Indicator lights
 
 - A white light marks the selected row. During a book download, a moving white
@@ -77,8 +82,8 @@ animation. Brightness and the other light options are in LED Settings.
 ## Book format
 
 See [Book format](BOOK_FORMAT.md) for the reader's supported markup and index
-structure. Newly converted books can use centered text and larger headings;
-inline bold and italic are not yet preserved on the badge.
+structure. Formatted books can include headings, centered text, bold, and
+italics. The included sample books use this format.
 
 ## Sample book sources
 

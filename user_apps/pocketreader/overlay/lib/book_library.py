@@ -1,6 +1,8 @@
 """Private PocketReader XL catalog, cache, package, and progress helpers."""
 
+from array import array
 import binascii
+import gc
 import asyncio as aio
 import hashlib
 import json
@@ -20,6 +22,42 @@ READING_STATE_PATH = "/data/pocketreader_reading_state.json"
 LOCAL_CATALOG_PATH = "/data/pocketreader_local_books.json"
 PREFERENCES_PATH = "/data/pocketreader_preferences.json"
 BOOK_DIR = "/books"
+
+
+class PagePositions:
+    """Store page triples compactly while retaining list-like access."""
+    def __init__(self):
+        self._values = array('I')
+
+    def append(self, page):
+        for value in page:
+            self._values.append(value)
+
+    def clear(self):
+        self._values = array('I')
+
+    def __len__(self):
+        return len(self._values) // 3
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError('Page index out of range')
+        start = index * 3
+        return [self._values[start], self._values[start + 1], self._values[start + 2]]
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __eq__(self, other):
+        try:
+            return len(self) == len(other) and all(self[index] == other[index] for index in range(len(self)))
+        except (TypeError, AttributeError):
+            return False
 
 
 class LibraryError(Exception):
@@ -43,6 +81,55 @@ def _write_json(path, value):
     except OSError:
         pass
     os.rename(temporary, path)
+
+
+def _write_font_indexes(path, index, current_key):
+    """Save indexes, shedding other fonts only when storage is exhausted."""
+    sizes = index['sizes']
+    family = current_key.split(':', 1)[0] if ':' in current_key else 'opendyslexic'
+    candidates = [key for key in sizes if key != current_key and
+                  (key.split(':', 1)[0] if ':' in key else 'opendyslexic') != family]
+    candidates.sort(key=lambda key: len(sizes[key].get('pages', '')) if isinstance(sizes[key], dict) else 0,
+                    reverse=True)
+    temporary, backup = path + '.tmp', path + '.index-backup'
+    if _exists(backup) and not _exists(path):
+        os.rename(backup, path)
+    if _exists(backup):
+        raise OSError('An index backup needs recovery')
+    while True:
+        try:
+            with open(temporary, 'w') as handle:
+                json.dump(index, handle)
+        except Exception as exc:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+            error = getattr(exc, 'errno', None)
+            if error is None and exc.args:
+                error = exc.args[0]
+            if not isinstance(exc, OSError) or error != 28 or not candidates:
+                raise
+            del sizes[candidates.pop(0)]
+            continue
+        break
+    had_original = _exists(path)
+    try:
+        if had_original:
+            os.rename(path, backup)
+        try:
+            os.rename(temporary, path)
+        except OSError:
+            if had_original:
+                os.rename(backup, path)
+            raise
+        if had_original:
+            os.remove(backup)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
 
 
 def _exists(path):
@@ -95,6 +182,19 @@ def library_sort_settings():
     if order not in ('title', 'author_first', 'author_last', 'added', 'opened'):
         order = 'title'
     return order, bool(settings.get('group_series', False))
+
+
+def library_auto_page_enabled():
+    settings = _read_json(PREFERENCES_PATH, {})
+    return bool(settings.get('library_auto_page', False)) if isinstance(settings, dict) else False
+
+
+def set_library_auto_page_enabled(enabled):
+    settings = _read_json(PREFERENCES_PATH, {})
+    if not isinstance(settings, dict):
+        settings = {}
+    settings['library_auto_page'] = bool(enabled)
+    _write_json(PREFERENCES_PATH, settings)
 
 
 def set_library_sort_settings(order, group_series):
@@ -324,6 +424,9 @@ def version_for(entry, size):
 def remove_download(entry):
     """Remove only the device copy; the catalog and progress remain intact."""
     path = package_path(entry)
+    index = BOOK_DIR + '/' + _safe_id(entry['id']) + '.pri'
+    if _exists(index):
+        os.remove(index)
     if _exists(path):
         os.remove(path)
     for size in ("small", "medium", "large", "xl"):
@@ -440,8 +543,16 @@ def ensure_space(required, protected_id, recoverable=None):
 
 
 
-def load_progress():
+def load_progress(book_ids=None):
     progress = _read_json(PROGRESS_PATH, {})
+    if book_ids is not None:
+        for book_id in book_ids:
+            if not book_id:
+                continue
+            saved = _read_book_progress(book_id)
+            if saved.get("book_id") == book_id:
+                progress[book_id] = saved
+        return progress
     try:
         files = os.listdir(BOOK_DIR)
     except OSError:
@@ -453,6 +564,7 @@ def load_progress():
             if saved.get("book_id") == book_id:
                 progress[book_id] = saved
     return progress
+
 
 
 def _read_book_progress(book_id):
@@ -504,7 +616,11 @@ class BookPackage:
         self.entry = entry
         self.handle = open(package_path(entry), "rb")
         self.header = json.loads(self.handle.readline())
-        if self.header.get("schema") not in (1, 2, 3, 4) or self.header.get("id") != entry.get("id"):
+        schema = self.header.get("schema")
+        if type(schema) is int and schema > 5:
+            self.handle.close()
+            raise LibraryError("This book requires a newer reader. Please update your device.")
+        if schema not in (1, 2, 3, 4, 5) or self.header.get("id") != entry.get("id"):
             self.handle.close()
             raise LibraryError("Book package metadata does not match catalog")
         self.data_offset = self.handle.tell()
@@ -515,6 +631,24 @@ class BookPackage:
         self.font_family = 'opendyslexic'
         self.advances = None
         self.lines_per_page = 0
+        self._compact_notes = {}
+        self._compact_page_details = {}
+
+    def _load_compact_notes(self):
+        length = int(self.header.get('notes_length', 0))
+        if not length:
+            self._compact_notes = {}
+            return
+        if self.body_end is None or length < 0 or length > 262144:
+            raise LibraryError('Book footnotes are too large')
+        self.handle.seek(self.body_end)
+        raw = self.handle.read(length)
+        if len(raw) != length:
+            raise LibraryError('Book footnotes are incomplete')
+        notes = json.loads(raw.decode('utf-8'))
+        if not isinstance(notes, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in notes.items()):
+            raise LibraryError('Book footnotes are invalid')
+        self._compact_notes = notes
 
     def _lines(self, position=None):
         markup = self.header.get('schema') == 4
@@ -523,7 +657,64 @@ class BookPackage:
                                        position, self.body_end, heading_advances=larger, markup=markup)
 
     def _layout_version(self):
+        if self.header.get('schema') == 5:
+            from lib import pocketreader_markup
+            return pocketreader_markup.LAYOUT_VERSION
         return pagination.MARKUP_LAYOUT_VERSION if self.header.get('schema') == 4 else pagination.PAGINATION_VERSION
+
+    def _compact_font_functions(self, size, family):
+        sizes = ('small', 'medium', 'large', 'xl')
+        spacing = (24, 32, 40, 56)
+        base = sizes.index(size)
+        def target(style):
+            heading = style.get('heading')
+            step = 2 if heading == 'h1' else 1 if heading == 'h2' else 0
+            return min(3, base + step)
+        def metrics(style):
+            return self._font_metrics(sizes[target(style)], family)[0]
+        def span(style):
+            return (spacing[target(style)] + spacing[base] - 1) // spacing[base]
+        return metrics, span
+
+    def _legacy_font_index_safe(self):
+        cached = getattr(self, '_legacy_font_safe', None)
+        if cached is not None:
+            return cached
+        tail = b''
+        try:
+            with open(package_path(self.entry), 'rb') as source:
+                while True:
+                    chunk = source.read(4096)
+                    if not chunk:
+                        break
+                    chunk = tail + chunk
+                    if any(byte >= 128 for byte in chunk):
+                        self._legacy_font_safe = False
+                        return False
+                    tail = chunk[-3:]
+        except OSError:
+            return False
+        self._legacy_font_safe = True
+        return True
+
+    def _font_metrics_match(self, expected, advances):
+        current = binascii.hexlify(hashlib.sha256(bytes(advances)).digest()).decode()
+        if expected == current:
+            return True
+        old = binascii.hexlify(hashlib.sha256(bytes(advances[:95])).digest()).decode()
+        return expected == old and self._legacy_font_index_safe()
+
+    def _legacy_compact_metrics_hash(self, size, family):
+        normal = self._font_metrics(size, family)[0]
+        metrics, _ = self._compact_font_functions(size, family)
+        combined = bytes(normal[:95]) + bytes(metrics({'heading':'h1'})[:95]) + bytes(metrics({'heading':'h2'})[:95])
+        return binascii.hexlify(hashlib.sha256(combined).digest()).decode()
+
+    def _compact_metrics_hash(self, size, family):
+        normal = self._font_metrics(size, family)[0]
+        metrics, _ = self._compact_font_functions(size, family)
+        combined = bytes(normal) + bytes(metrics({'heading':'h1'})) + bytes(metrics({'heading':'h2'}))
+        return binascii.hexlify(hashlib.sha256(combined).digest()).decode()
 
     def _larger_metrics(self, size, family):
         larger = {'small':'medium', 'medium':'large', 'large':'xl', 'xl':'xl'}[size]
@@ -560,8 +751,10 @@ class BookPackage:
         return chapters
 
     def _read_size_index(self, size, advances, lines):
-        index = _read_json(self._index_path(), {})
-        metrics = binascii.hexlify(hashlib.sha256(bytes(advances)).digest()).decode()
+        path = self._index_path()
+        if not _exists(path) and _exists(path + '.index-backup'):
+            os.rename(path + '.index-backup', path)
+        index = _read_json(path, {})
         if (index.get("version") != 1 or index.get("book_id") != self.entry["id"]
                 or index.get("sha256") != self.entry.get("sha256")):
             return None
@@ -571,13 +764,18 @@ class BookPackage:
         selected = sizes.get(size, {})
         if not isinstance(selected, dict):
             return None
-        if (selected.get("layout_version") != self._layout_version() or selected.get("metrics_sha256") != metrics
+        if (selected.get("layout_version") != self._layout_version() or not self._font_metrics_match(selected.get("metrics_sha256"), advances)
                 or selected.get("lines") != lines):
             return None
         if self.header.get('schema') == 4:
             larger_hash = binascii.hexlify(hashlib.sha256(bytes(self._larger_metrics_for_key(size))).digest()).decode()
-            if selected.get('heading_metrics_sha256') != larger_hash:
+            if selected.get('heading_metrics_sha256') != larger_hash and not self._font_metrics_match(selected.get('heading_metrics_sha256'), self._larger_metrics_for_key(size)):
                 return None
+        if self.header.get('schema') == 5:
+            family, label = size.split(':', 1) if ':' in size else ('opendyslexic', size)
+            if selected.get('style_metrics_sha256') != self._compact_metrics_hash(label, family):
+                if selected.get('style_metrics_sha256') != self._legacy_compact_metrics_hash(label, family) or not self._legacy_font_index_safe():
+                    return None
         pages = selected.get("pages")
         if selected.get("encoding") == "delta-varint-base64":
             try:
@@ -597,6 +795,16 @@ class BookPackage:
             if page[0] >= body_limit or page[0] < previous_offset or page[2] < previous_word:
                 return None
             previous_offset, previous_word = page[0], page[2]
+        if self.header.get('schema') == 5:
+            details = selected.get('note_pages', {})
+            if not isinstance(details, dict) or (self.header.get('notes_length') and not details):
+                return None
+            for key, detail in details.items():
+                if not isinstance(key, str) or not key.isdigit() or int(key) >= len(pages) or not isinstance(detail, dict):
+                    return None
+                if not isinstance(detail.get('body'), list) or not isinstance(detail.get('notes'), list):
+                    return None
+            self._compact_page_details = details
         # PRI positions are relative to the book body so the converter and
         # badge use the same portable format; the reader seeks absolute offsets.
         return [[self.data_offset + page[0], page[1], page[2]] for page in pages]
@@ -612,14 +820,21 @@ class BookPackage:
             "layout_version": self._layout_version(), "lines": lines,
             "metrics_sha256": binascii.hexlify(hashlib.sha256(bytes(advances)).digest()).decode(),
             "encoding": "delta-varint-base64",
-            "pages": pagination.pack_page_positions([[page[0] - self.data_offset, page[1], page[2]] for page in pages])}
+            "pages": pagination.pack_page_positions(([page[0] - self.data_offset, page[1], page[2]] for page in pages))}
         if self.header.get('schema') == 4:
             index['sizes'][size]['heading_metrics_sha256'] = binascii.hexlify(
                 hashlib.sha256(bytes(self._larger_metrics_for_key(size))).digest()).decode()
-        _write_json(path, index)
+        if self.header.get('schema') == 5:
+            family, label = size.split(':', 1) if ':' in size else ('opendyslexic', size)
+            index['sizes'][size]['style_metrics_sha256'] = self._compact_metrics_hash(label, family)
+            if self._compact_page_details:
+                index['sizes'][size]['note_pages'] = self._compact_page_details
+        _write_font_indexes(path, index, size)
 
     def _font_metrics(self, size, family):
         suffix = {'small': '18', 'medium': '24', 'large': '30', 'xl': '42'}[size]
+        if family == 'ubuntu' and size == 'small':
+            suffix = '20'
         prefix = {'opendyslexic': 'OPEN_DYSLEXIC', 'ubuntu': 'UBUNTU', 'tinos': 'TINOS'}[family]
         lines = {'small': 32, 'medium': 24, 'large': 19, 'xl': 14}[size]
         return getattr(font_data, prefix + suffix + '_ADVANCES'), lines
@@ -630,6 +845,8 @@ class BookPackage:
         self.size = size
         self.font_family = family
         self.advances, self.lines_per_page = self._font_metrics(size, family)
+        if self.header.get('schema') == 5:
+            self._load_compact_notes()
         key = size if family == 'opendyslexic' else family + ':' + size
         saved = self._read_size_index(key, self.advances, self.lines_per_page)
         if saved:
@@ -640,28 +857,78 @@ class BookPackage:
             self.pages = embedded
             self._save_size_index(key, self.advances, self.lines_per_page, embedded)
             return
-        pages = []
-        count = 0
-        for offset, line_index, word, text in self._lines():
-            if text is None:
-                count = 0
-                continue
-            if pagination.needs_heading_page_break(text, count, self.lines_per_page,
-                    self.header.get('schema') == 4 and self._larger_metrics(size, family) != self.advances):
-                count = 0
-            if count == 0:
-                if not text:
+        if self.header.get('schema') == 5:
+            from lib import pocketreader_markup
+            metrics, span = self._compact_font_functions(size, family)
+            pages = PagePositions()
+            try:
+                self._compact_page_details = {}
+                if self._compact_notes:
+                    iterator = pocketreader_markup.iter_footnoted_preview(
+                        self.handle, self.data_offset, self.advances, 608, self.lines_per_page,
+                        self._compact_notes, metrics, span, self.body_end)
+                else:
+                    iterator = pocketreader_markup.iter_compact_pages(
+                        self.handle, self.data_offset, self.advances, 608, self.lines_per_page,
+                        metrics, with_positions=True, row_span_for_style=span, body_end=self.body_end)
+                last_cursor = None
+                for page in iterator:
+                    if self._compact_notes:
+                        body = page['body']
+                        if body:
+                            cursor = body[0][:3]
+                            last_cursor = body[-1][:3]
+                        elif last_cursor:
+                            cursor = last_cursor
+                        else:
+                            raise LibraryError('Footnote continuation has no source page')
+                        detail = pocketreader_markup.footnote_page_descriptor(page, self.data_offset)
+                        if detail:
+                            self._compact_page_details[str(len(pages))] = detail
+                    else:
+                        cursor = page[0][:3]
+                    pages.append(list(cursor))
+                    if len(pages) % 32 == 0:
+                        await aio.sleep_ms(0)
+                if not pages:
+                    raise LibraryError('Book has no readable text')
+                self.pages = pages
+                self._save_size_index(key, self.advances, self.lines_per_page, pages)
+            except MemoryError:
+                pages.clear()
+                self.pages = []
+                self._compact_page_details = {}
+                gc.collect()
+                raise
+            return
+        pages = PagePositions()
+        try:
+            count = 0
+            for offset, line_index, word, text in self._lines():
+                if text is None:
+                    count = 0
                     continue
-                pages.append([offset, line_index, word])
-            count += 1
-            if count >= self.lines_per_page:
-                count = 0
-            if len(pages) % 32 == 0:
-                await aio.sleep_ms(0)
-        if not pages:
-            raise LibraryError("Book has no readable text")
-        self.pages = pages
-        self._save_size_index(key, self.advances, self.lines_per_page, pages)
+                if pagination.needs_heading_page_break(text, count, self.lines_per_page,
+                        self.header.get('schema') == 4 and self._larger_metrics(size, family) != self.advances):
+                    count = 0
+                if count == 0:
+                    if not text:
+                        continue
+                    pages.append([offset, line_index, word])
+                count += 1
+                if count >= self.lines_per_page:
+                    count = 0
+                if len(pages) % 32 == 0:
+                    await aio.sleep_ms(0)
+            if not pages:
+                raise LibraryError("Book has no readable text")
+            self.pages = pages
+            self._save_size_index(key, self.advances, self.lines_per_page, pages)
+        except MemoryError:
+            pages.clear()
+            self.pages = []
+            gc.collect()
+            raise
 
     def has_index(self, size, family='opendyslexic'):
         if self.header.get("schema") == 1:
@@ -674,16 +941,20 @@ class BookPackage:
 
     def _embedded_metadata(self, size, advances, lines):
         schema = self.header.get("schema")
-        if schema not in (3, 4) or self.header.get("index_version") != self._layout_version():
+        if schema not in (3, 4, 5) or self.header.get("index_version") != self._layout_version():
             return None
         meta = self.header.get("indexes", {}).get(size, {})
-        metrics = binascii.hexlify(hashlib.sha256(bytes(advances)).digest()).decode()
-        if meta.get("metrics_sha256") != metrics or meta.get("lines") != lines:
+        if not self._font_metrics_match(meta.get("metrics_sha256"), advances) or meta.get("lines") != lines:
             return None
         if schema == 4:
             larger_hash = binascii.hexlify(hashlib.sha256(bytes(self._larger_metrics_for_key(size))).digest()).decode()
-            if meta.get('heading_metrics_sha256') != larger_hash:
+            if meta.get('heading_metrics_sha256') != larger_hash and not self._font_metrics_match(meta.get('heading_metrics_sha256'), self._larger_metrics_for_key(size)):
                 return None
+        if schema == 5:
+            family, label = size.split(':', 1) if ':' in size else ('opendyslexic', size)
+            if meta.get('style_metrics_sha256') != self._compact_metrics_hash(label, family):
+                if meta.get('style_metrics_sha256') != self._legacy_compact_metrics_hash(label, family) or not self._legacy_font_index_safe():
+                    return None
         offset, count = int(meta.get("offset", -1)), int(meta.get("count", 0))
         if offset < 0 or count < 1 or count > 100000 or self.body_end is None:
             return None
@@ -741,9 +1012,59 @@ class BookPackage:
             self.handle.close()
             self.handle = None
 
+    def _read_compact_footnote_page(self, detail):
+        from lib import pocketreader_markup
+        metrics, _ = self._compact_font_functions(self.size, self.font_family)
+        body = []
+        cache = {}
+        for relative, line_number, reserved in detail['body']:
+            if reserved:
+                body.append([('', {'_reserved': True})])
+                continue
+            offset = self.data_offset + int(relative)
+            if offset not in cache:
+                cache[offset] = {}
+                for position, index, runs in pocketreader_markup.iter_layout_records(
+                        self.handle, offset, self.advances, 608, metrics, body_end=self.body_end):
+                    if position != offset:
+                        break
+                    cache[offset][index] = runs
+            if line_number not in cache[offset]:
+                raise LibraryError('Footnote page index is invalid')
+            body.append(cache[offset][line_number])
+        footer = []
+        wrapped = {}
+        for ident, line_number in detail['notes']:
+            if ident not in self._compact_notes:
+                raise LibraryError('Book footnote is missing')
+            if ident not in wrapped:
+                wrapped[ident] = pocketreader_markup.wrap_runs([(self._compact_notes[ident], {})], self.advances, 608)
+            if not 0 <= int(line_number) < len(wrapped[ident]):
+                raise LibraryError('Footnote page index is invalid')
+            footer.append(wrapped[ident][int(line_number)])
+        if detail.get('notice'):
+            footer.append([('Footnote continues on next page', {})])
+        if not detail.get('continuation'):
+            body.extend([[] for _ in range(max(0, self.lines_per_page - len(body) - len(footer)))])
+        return body + footer
+
     def read_page(self, page):
         page = max(0, min(int(page), len(self.pages) - 1))
         offset, length, start_word = self.pages[page]
+        if self.header['schema'] == 5:
+            from lib import pocketreader_markup
+            detail = self._compact_page_details.get(str(page))
+            if detail:
+                return self._read_compact_footnote_page(detail), start_word
+            metrics, span = self._compact_font_functions(self.size, self.font_family)
+            pages = pocketreader_markup.iter_compact_pages(
+                self.handle, offset, self.advances, 608, self.lines_per_page, metrics,
+                row_span_for_style=span, skip_initial_lines=length, body_end=self.body_end)
+            try:
+                compact_page = next(pages)
+            except StopIteration:
+                compact_page = []
+            return [item[-1] for item in compact_page], start_word
         if self.header["schema"] in (2, 3, 4):
             lines = []
             for record_offset, line_index, _, text in self._lines(offset):

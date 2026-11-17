@@ -24,9 +24,30 @@ class LibrarySelection(unittest.TestCase):
         code = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(name='App', bases=[], keywords=[], body=methods, decorator_list=[])], type_ignores=[]))
         cls.scope = {'REFRESH_ROW': 8, 'PORTRAIT_WIDTH': 672, 'BLACK': 1, 'WHITE': 0,
                      'LIBRARY_ROW_Y': 96, 'LIBRARY_ROW_HEIGHT': 96, 'LIBRARY_FRAME_HEIGHT': 84,
+                     'book_library': types.SimpleNamespace(library_auto_page_enabled=lambda: False),
                      'HACK16': types.SimpleNamespace(measure=lambda text: len(text) * 8),
+                     'HACK24': types.SimpleNamespace(measure=lambda text: len(text) * 8),
                      'display': types.SimpleNamespace(black=None, red=None)}
         exec(compile(code, str(SOURCE), 'exec'), cls.scope)
+
+    def test_optional_scroll_crosses_pages_at_first_and_last_titles(self):
+        app = self.scope['App'](); app.all_books = [{} for _ in range(10)]
+        app.library_page = 0; app._show_library_page(); app.selected = 7; app._bottom_choice = 0
+        app._dirty = True; app._show_selection_led = lambda: None
+        original = self.scope['book_library']
+        self.scope['book_library'] = types.SimpleNamespace(library_auto_page_enabled=lambda: True)
+        try:
+            app._move_selection(1)
+            self.assertEqual((app.library_page, app.selected, app._bottom_choice), (0, 8, 0))
+            app._move_selection(1)
+            self.assertEqual((app.library_page, app.selected, app._bottom_choice), (0, 8, 1))
+            app._move_selection(1)
+            self.assertEqual((app.library_page, app.selected), (1, 0))
+            self.assertTrue(app._page_update_pending)
+            app._move_selection(-1)
+            self.assertEqual((app.library_page, app.selected), (0, 7))
+        finally:
+            self.scope['book_library'] = original
 
     def test_moving_selection_dismisses_error_with_full_refresh(self):
         app=self.scope['App']();app.books=[{},{}];app.selected=0;app._bottom_choice=0

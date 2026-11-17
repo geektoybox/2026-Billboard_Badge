@@ -15,6 +15,33 @@ class ReadingChapters(unittest.TestCase):
         exec(compile(code, str(SOURCE), 'exec'), scope)
         return scope['App']()
 
+    def test_library_refresh_chord_fires_only_after_hold_and_release(self):
+        class Button:
+            value = False; elapsed = 0; _pressed_state = 0
+            def pressed_ms(self): return self.elapsed
+        previous, next_button = Button(), Button()
+        scope = {'PhysicalMenuMinus': previous, 'UserB': next_button, 'PRESSED_READ': 2, 'EXIT_HOLD_MS': 3000}
+        app = self.methods(('_handle_library_refresh_chord',), scope)
+        app.detail = app._bottom_menu = app._remove_prompt = False
+        app._catalog_pending = False; app._previous_tracking = app._sleep_button_tracking = False
+        events = []
+        app._update_page_hold_feedback = lambda elapsed: events.append(('progress', elapsed))
+        app._set_page_hold_feedback = lambda color: events.append(('ready', color))
+        app._clear_page_hold_feedback = lambda: events.append(('clear',))
+        previous.value = next_button.value = True
+        previous.elapsed = next_button.elapsed = 2999
+        self.assertTrue(app._handle_library_refresh_chord()); self.assertFalse(app._catalog_pending)
+        previous.elapsed = next_button.elapsed = 3000
+        self.assertTrue(app._handle_library_refresh_chord()); self.assertFalse(app._catalog_pending)
+        previous.value = False
+        self.assertTrue(app._handle_library_refresh_chord()); self.assertTrue(app._catalog_pending)
+        self.assertIn(('ready', 'blue'), events)
+        self.assertTrue(app._handle_library_refresh_chord())
+        next_button.value = False
+        self.assertTrue(app._handle_library_refresh_chord())
+        self.assertEqual((previous._pressed_state, next_button._pressed_state), (2, 2))
+        self.assertFalse(app._handle_library_refresh_chord())
+
     def test_hold_both_buttons_opens_toc_without_page_press(self):
         previous = types.SimpleNamespace(value=False, _pressed_state=0)
         next_button = types.SimpleNamespace(value=False, _pressed_state=0)
@@ -59,6 +86,50 @@ class ReadingChapters(unittest.TestCase):
         button.value = False; app._handle_select_button()
         self.assertEqual(app.current_page, 2); self.assertEqual(saved, [2]); self.assertFalse(app._toc_menu)
 
+    def test_bookmark_toggle_requests_partial_refresh(self):
+        class Button:
+            value = False; _pressed_state = 0
+            def pressed_ms(self): return 0
+        button = Button(); saved = []
+        library = types.SimpleNamespace(bookmarks=lambda _: list(saved),
+            add_bookmark=lambda _, word: saved.append(word),
+            remove_bookmarks=lambda _, words: saved.clear())
+        scope = {'UserA': button, 'EXIT_HOLD_MS': 3000, 'PRESSED_READ': 2, 'book_library': library}
+        app = self.methods(('_handle_select_button', '_page_for_word'), scope)
+        app.detail = True; app._toc_menu = app._bookmark_menu = False
+        app.reader = types.SimpleNamespace(entry={'id': 'book'}, pages=[[0, 0, 0], [1, 0, 10]])
+        app.current_page = 1; app._bookmarks = []; app._suppress_select = app._select_tracking = False
+        app._select_long_fired = False
+        app._update_reading_hold_feedback = lambda *args: None
+        app._clear_reading_hold_feedback = lambda *args: None
+        for expected in ('BOOKMARK SAVED', 'BOOKMARK REMOVED'):
+            button.value = True; app._handle_select_button()
+            button.value = False; app._handle_select_button()
+            self.assertEqual(app.update_status, expected)
+            self.assertTrue(app._small_update)
+            self.assertEqual(app._bookmark_partial, ('book', 1))
+
+    def test_remove_book_refreshes_list_and_uses_correct_status(self):
+        class Button:
+            value = False; _pressed_state = 0
+            def pressed_ms(self): return 0
+        for remote in (False, True):
+            button = Button(); events = []
+            library = types.SimpleNamespace(remove_download=lambda entry: events.append(('remove', entry['id'])))
+            scope = {'UserA': button, 'EXIT_HOLD_MS': 3000, 'PRESSED_READ': 2, 'book_library': library}
+            app = self.methods(('_handle_select_button',), scope)
+            app.detail = False; app._remove_prompt = app._remove_yes = True; app._bottom_menu = False
+            app.books = [{'id': 'book'}]; app.selected = 0
+            app._suppress_select = app._select_tracking = app._select_long_fired = False
+            app._can_redownload = lambda entry: remote
+            app._load_cached_catalog = lambda: events.append(('reload',))
+            app._clear_page_hold_feedback = lambda: None
+            app._show_selection_led = lambda: None
+            button.value = True; app._handle_select_button()
+            button.value = False; app._handle_select_button()
+            self.assertEqual(events, [('remove', 'book'), ('reload',)])
+            self.assertEqual(app.update_status, 'DOWNLOAD REMOVED' if remote else 'BOOK REMOVED')
+
     def test_bookmark_list_opens_after_three_second_hold_is_released(self):
         class Button:
             value = False; elapsed = 0; _pressed_state = 0
@@ -88,7 +159,7 @@ class ReadingChapters(unittest.TestCase):
                 self.texts.append((text, y))
             def fill_rect(self, *args): pass
         font = Font()
-        scope = {'HACK16':font, 'BLACK':1, 'RED':2, 'PORTRAIT_WIDTH':672,
+        scope = {'HACK24':font, 'HACK16':font, 'BLACK':1, 'RED':2, 'PORTRAIT_WIDTH':672,
                  'book_library':types.SimpleNamespace(text_size=lambda: 'medium'),
                  'READER_FAMILIES':{'opendyslexic':{'medium':(font, 32, 24)}}}
         app = self.methods(('_draw_detail',), scope)

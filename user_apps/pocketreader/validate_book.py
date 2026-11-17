@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -36,20 +37,41 @@ def validate_book(book_path, index_path=None):
     head, sep, body=raw.partition(b'\n')
     if not sep or len(head)>65536: raise ValueError('Invalid book header')
     header=json.loads(head)
-    if not isinstance(header,dict) or header.get('schema') not in (2,3,4):
-        raise ValueError('Expected a reflowable schema 2, 3, or 4 book')
+    if not isinstance(header,dict) or header.get('schema') not in (2,3,4,5):
+        raise ValueError('Expected a reflowable schema 2, 3, 4, or 5 book')
     book_id=header.get('id'); total=header.get('word_count')
     if (not isinstance(book_id,str) or not 1 <= len(book_id) <= 96
             or any(not ('a' <= c <= 'z' or 'A' <= c <= 'Z' or '0' <= c <= '9' or c in '-_') for c in book_id)
             or type(total) is not int or total<1):
         raise ValueError('Invalid book ID or word count')
+    notes = {}
     if 'body_length' in header:
         length=header['body_length']
         if type(length) is not int or not 0 < length <= len(body): raise ValueError('Invalid body length')
+        if header['schema'] == 5:
+            note_length = header.get('notes_length', 0)
+            if type(note_length) is not int or note_length < 0 or note_length > 262144 or length + note_length > len(body):
+                raise ValueError('Invalid footnote section length')
+            if note_length:
+                notes = json.loads(body[length:length + note_length])
+                if not isinstance(notes, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in notes.items()):
+                    raise ValueError('Invalid footnote section')
         body=body[:length]
     words=0
+    markup = None
+    if header['schema'] == 5:
+        spec = importlib.util.spec_from_file_location('pocketreader_markup',
+            Path(__file__).resolve().parent / 'overlay/lib/pocketreader_markup.py')
+        markup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(markup)
     for record in body.decode('utf-8').split('\n'):
         record=record.rstrip('\r')
+        if markup is not None:
+            runs = markup.decode_runs(record)
+            if any(style.get('footnote') and style['footnote'] not in notes for _, style in runs):
+                raise ValueError('Footnote reference is missing its note')
+            words += len(''.join(text for text, _ in runs).split())
+            continue
         if record=='\x1e': continue
         if record.startswith('\x1f'):
             if header['schema'] != 4 or len(record)<3 or record[1] not in 'CHL':
@@ -75,10 +97,33 @@ def validate_book(book_path, index_path=None):
         for key, value in sizes.items():
             if not isinstance(key,str) or not isinstance(value,dict): raise ValueError('Invalid size index')
             if value.get('encoding') != 'delta-varint-base64': raise ValueError('Unsupported page-index encoding')
-            if value.get('layout_version') != (2 if header['schema']==4 else 1): raise ValueError('Wrong layout version')
+            if value.get('layout_version') != (4 if header['schema']==5 else 2 if header['schema']==4 else 1): raise ValueError('Wrong layout version')
             if header['schema']==4 and len(value.get('heading_metrics_sha256','')) != 64:
                 raise ValueError('Missing heading font metrics')
-            for offset, line, word in decode_pages(value.get('pages','')):
+            if header['schema']==5 and len(value.get('style_metrics_sha256','')) != 64:
+                raise ValueError('Missing styled font metrics')
+            pages = decode_pages(value.get('pages',''))
+            if header['schema']==5 and notes:
+                note_pages = value.get('note_pages')
+                if not isinstance(note_pages, dict) or not note_pages:
+                    raise ValueError('Missing footnote page information')
+                for page_number, detail in note_pages.items():
+                    if not isinstance(page_number, str) or not page_number.isdigit() or int(page_number) >= len(pages) or not isinstance(detail, dict):
+                        raise ValueError('Invalid footnote page')
+                    rows, footer = detail.get('body'), detail.get('notes')
+                    if not isinstance(rows, list) or not isinstance(footer, list) or len(rows) + len(footer) + bool(detail.get('notice')) > value.get('lines', 0):
+                        raise ValueError('Footnote page does not fit')
+                    if detail.get('continuation') and rows:
+                        raise ValueError('Footnote continuation contains body text')
+                    if not detail.get('continuation') and len(footer) + bool(detail.get('notice')) > value.get('lines', 0) // 2:
+                        raise ValueError('Footnotes occupy more than half the source page')
+                    for row in rows:
+                        if not isinstance(row, list) or len(row) != 3 or type(row[0]) is not int or not 0 <= row[0] < len(body) or type(row[1]) is not int or row[1] < 0 or type(row[2]) is not bool:
+                            raise ValueError('Invalid footnote body position')
+                    for note in footer:
+                        if not isinstance(note, list) or len(note) != 2 or note[0] not in notes or type(note[1]) is not int or note[1] < 0:
+                            raise ValueError('Invalid footnote position')
+            for offset, line, word in pages:
                 if offset>=len(body) or word>total: raise ValueError('Page position outside book')
             size_count+=1
         chapter_count=len(chapters)

@@ -13,6 +13,17 @@ MAX_BOOK = 4 * 1024 * 1024
 MAX_INDEX = 1024 * 1024
 
 
+
+def _error_detail(exc):
+    """Keep timeout and empty exception messages useful on the badge."""
+    name = type(exc).__name__
+    if name == 'TimeoutError':
+        return 'Connection timed out'
+    if name == 'MemoryError':
+        return 'Not enough memory'
+    return str(exc).strip() or name
+
+
 def enabled():
     settings = book_library._read_json(book_library.PREFERENCES_PATH, {})
     return isinstance(settings, dict) and settings.get('starter_library') is True
@@ -38,7 +49,10 @@ def _valid_hash(value):
 
 
 def _validate_catalog(data):
-    if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('books'), list) or len(data['books']) > 100:
+    schema = data.get('schema') if isinstance(data, dict) else None
+    if type(schema) is int and schema > 1:
+        raise book_library.LibraryError('Library requires a newer reader. Please update your device.')
+    if not isinstance(data, dict) or schema != 1 or not isinstance(data.get('books'), list) or len(data['books']) > 100:
         raise book_library.LibraryError('Invalid starter catalog')
     seen = set()
     for entry in data['books']:
@@ -114,7 +128,7 @@ async def refresh():
         book_library._write_json(CATALOG_PATH, data)
         return data['books']
     except Exception as exc:
-        raise book_library.LibraryError('Starter library unavailable: ' + str(exc))
+        raise book_library.LibraryError('Starter library unavailable: ' + _error_detail(exc))
 
 
 async def _open_download(url, expected_size):
@@ -159,10 +173,14 @@ async def _open_download(url, expected_size):
         raise
 
 
-async def _fetch_file(url, temporary, expected_size, expected_hash):
+async def _fetch_file(url, temporary, expected_size, expected_hash,
+                      progress=None, offset=0, total_size=None):
     reader, writer = await _open_download(url, expected_size)
     digest = hashlib.sha256()
     received = 0
+    total_size = total_size or expected_size
+    if progress:
+        progress(offset, total_size)
     try:
         with open(temporary, 'wb') as output:
             while True:
@@ -174,6 +192,8 @@ async def _fetch_file(url, temporary, expected_size, expected_hash):
                     raise book_library.LibraryError('Download too large')
                 digest.update(chunk)
                 output.write(chunk)
+                if progress:
+                    progress(offset + received, total_size)
                 await aio.sleep_ms(0)
     finally:
         writer.close()
@@ -182,11 +202,13 @@ async def _fetch_file(url, temporary, expected_size, expected_hash):
         raise book_library.LibraryError('Download verification failed')
 
 
-async def _fetch_starter_file(name, temporary, expected_size, expected_hash):
+async def _fetch_starter_file(name, temporary, expected_size, expected_hash,
+                              progress=None, offset=0, total_size=None):
     error = None
     for base in (BASE,):
         try:
-            await _fetch_file(base + name, temporary, expected_size, expected_hash)
+            await _fetch_file(base + name, temporary, expected_size, expected_hash,
+                              progress, offset, total_size)
             return
         except Exception as exc:
             error = exc
@@ -194,10 +216,10 @@ async def _fetch_starter_file(name, temporary, expected_size, expected_hash):
                 os.remove(temporary)
             except OSError:
                 pass
-    raise book_library.LibraryError('Starter download failed: ' + str(error))
+    raise book_library.LibraryError('Starter download failed: ' + _error_detail(error))
 
 
-async def download(entry):
+async def download(entry, progress=None):
     if not enabled():
         raise book_library.LibraryError('Starter library is off')
     _validate_catalog({'schema': 1, 'books': [entry]})
@@ -238,13 +260,19 @@ async def download(entry):
                               book_id, recoverable=recoverable)
     book_library._write_json(CATALOG_PATH, catalog)
     book_tmp, index_tmp = path + '.tmp', index + '.tmp'
+    total_size = entry['index_size'] + entry['size']
     try:
-        await _fetch_starter_file(book_id + '.pri', index_tmp, entry['index_size'], entry['index_sha256'])
+        await _fetch_starter_file(book_id + '.pri', index_tmp, entry['index_size'],
+                                  entry['index_sha256'], progress, 0, total_size)
         with open(index_tmp, 'r') as file:
             sidecar = json.load(file)
-        if not isinstance(sidecar, dict) or sidecar.get('version') != 1 or sidecar.get('book_id') != book_id or sidecar.get('sha256') != entry['sha256']:
+        version = sidecar.get('version') if isinstance(sidecar, dict) else None
+        if type(version) is int and version > 1:
+            raise book_library.LibraryError('Library index requires a newer reader. Please update your device.')
+        if not isinstance(sidecar, dict) or version != 1 or sidecar.get('book_id') != book_id or sidecar.get('sha256') != entry['sha256']:
             raise book_library.LibraryError('Invalid starter index')
-        await _fetch_starter_file(book_id + '.prb', book_tmp, entry['size'], entry['sha256'])
+        await _fetch_starter_file(book_id + '.prb', book_tmp, entry['size'],
+                                  entry['sha256'], progress, entry['index_size'], total_size)
         if book_library._exists(path) or book_library._exists(index):
             raise book_library.LibraryError('Book appeared during download')
         os.rename(book_tmp, path)

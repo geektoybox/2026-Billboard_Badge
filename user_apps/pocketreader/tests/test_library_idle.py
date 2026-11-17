@@ -33,12 +33,12 @@ class LibraryIdle(unittest.TestCase):
         instance._select_first_on_library_page = lambda: None
         instance._draw = lambda: None; instance.reader_display = types.SimpleNamespace(ready=lambda: False)
         instance._quick_boot_enabled = False
-        select.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_inline, 'size')
-        select.state = True; instance._run_settings_menu(); self.assertEqual(values['size'], 'medium')
-        down.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_cursor, 1)
         select.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_inline, 'family')
         down.state = True; instance._run_settings_menu(); select.state = True; instance._run_settings_menu()
         self.assertEqual(values['font'], 'ubuntu'); self.assertIsNone(instance._settings_inline)
+        down.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_cursor, 1)
+        select.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_inline, 'size')
+        select.state = True; instance._run_settings_menu(); self.assertEqual(values['size'], 'medium')
         instance._settings_cursor = 2
         select.state = True; instance._run_settings_menu(); self.assertTrue(instance._led_menu)
         instance._settings_cursor = 3
@@ -54,11 +54,11 @@ class LibraryIdle(unittest.TestCase):
         instance._settings_cursor = 2; select.state = True; instance._run_settings_menu(); self.assertEqual(values['progress'], 'chapter')
         select.state = True; instance._run_settings_menu(); self.assertEqual(values['progress'], 'book')
         back.state = True; instance._run_settings_menu(); self.assertFalse(instance._led_menu)
-        instance._settings_cursor = 6; select.state = True; instance._run_settings_menu()
+        instance._settings_cursor = 5; select.state = True; instance._run_settings_menu()
         self.assertTrue(values['quick_boot']); self.assertTrue(instance.reader_display.quick_boot)
-        down.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_cursor, 7)
+        down.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_cursor, 6)
         down.state = True; instance._run_settings_menu(); self.assertEqual(instance._settings_cursor, 0)
-        instance._settings_cursor = 5; instance._begin_wifi_menu = lambda: values.update(wifi=True)
+        instance._settings_cursor = 4; instance._begin_wifi_menu = lambda: values.update(wifi=True)
         select.state = True; instance._run_settings_menu(); self.assertTrue(values['wifi'])
         instance._settings_menu = True
         back.state = True; instance._run_settings_menu(); self.assertFalse(instance._settings_menu)
@@ -83,7 +83,7 @@ class LibraryIdle(unittest.TestCase):
         instance._sleep_options_menu = instance._font_options_menu = False
         instance._show_settings_led()
         self.assertEqual(lights[5], (2,2,2)); self.assertEqual(lights[7], (0,0,2))
-        self.assertEqual(lights[1], (0,0,2)); self.assertEqual(lights[0], (0,0,2))
+        self.assertEqual(lights[1], (0,0,2)); self.assertEqual(lights[0], (0,0,0))
         instance._led_menu = True; instance._show_settings_led()
         self.assertEqual(lights[4], (0,0,2)); self.assertEqual(lights[3], (0,0,0))
         instance._sleep_options_menu = True; instance._show_settings_led()

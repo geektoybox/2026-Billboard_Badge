@@ -3,6 +3,7 @@
 import asyncio as aio
 import esp32
 import framebuf
+import gc
 import machine
 import os
 import time
@@ -96,13 +97,15 @@ class PackedFont:
     def advance(self, character):
         codepoint = ord(character)
         if codepoint < 32 or codepoint > 126:
-            codepoint = ord("?")
+            extra = "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿāăēĕėīĭōŏŒœūŭſǽȳ˘̸ΑΓΔΕΛΜΝΞΠάέήίαβγδεζηθικλμνξοπρςστυφχψωόύώἀἁἄἅἐἔἠἡἦἰἱἷἸὀὁὄὐὑὔὡὦὰὲὴὶὸὺὼῆῇῖῥῦῳῶῷ‐–—‘’‛“”†‡•…′″⁄⅓⅛✠".find(character)
+            codepoint = 127 + extra if extra >= 0 and 95 + extra < len(self.advances) else ord("?")
         return self.advances[codepoint - 32]
 
     def glyph(self, character):
         codepoint = ord(character)
         if codepoint < 32 or codepoint > 126:
-            codepoint = ord("?")
+            extra = "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿāăēĕėīĭōŏŒœūŭſǽȳ˘̸ΑΓΔΕΛΜΝΞΠάέήίαβγδεζηθικλμνξοπρςστυφχψωόύώἀἁἄἅἐἔἠἡἦἰἱἷἸὀὁὄὐὑὔὡὦὰὲὴὶὸὺὼῆῇῖῥῦῳῶῷ‐–—‘’‛“”†‡•…′″⁄⅓⅛✠".find(character)
+            codepoint = 127 + extra if extra >= 0 and 95 + extra < len(self.advances) else ord("?")
         index = codepoint - 32
         if index not in self._cache:
             advance = self.advances[index]
@@ -143,7 +146,8 @@ def _reader_family(prefix):
     result = {}
     for label, size, spacing, lines in (('small', 18, 24, 32), ('medium', 24, 32, 24),
                                          ('large', 30, 40, 19), ('xl', 42, 56, 14)):
-        name = prefix + str(size)
+        font_size = 20 if prefix == 'UBUNTU' and label == 'small' else size
+        name = prefix + str(font_size)
         result[label] = (PackedFont(getattr(font_data, name + '_OFFSET'),
                                     getattr(font_data, name + '_LINE_HEIGHT'),
                                     getattr(font_data, name + '_ADVANCES')), spacing, lines)
@@ -183,7 +187,7 @@ class PortraitCanvas:
         self.fill_rect(x, y, thickness, height, color)
         self.fill_rect(x + width - thickness, y, thickness, height, color)
 
-    def text(self, text, x, y, scale=1, color=BLACK, max_width=None, font=None):
+    def text(self, text, x, y, scale=1, color=BLACK, max_width=None, font=None, bold=False, italic=False, small_caps=False):
         if y & 7:
             raise ValueError("bitmap text y must align to an 8-pixel boundary")
         text = str(text)
@@ -202,11 +206,63 @@ class PortraitCanvas:
         cursor = x
         physical_x = PHYSICAL_WIDTH - y - font.line_height
         for character in text:
+            if small_caps and 'a' <= character <= 'z':
+                glyph, advance = font.glyph(character.upper())
+                scaled_width = max(1, (advance * 3 + 3) // 4)
+                scaled_height = max(1, (font.line_height * 3 + 3) // 4)
+                for column in range(scaled_height):
+                    shift = column // 8 if italic else 0
+                    for row in range(scaled_width):
+                        if glyph.pixel(min(font.line_height - 1, column * 4 // 3), min(advance - 1, row * 4 // 3)):
+                            plane.pixel(physical_x + column, cursor + row + shift, 1)
+                            if bold:
+                                plane.pixel(physical_x + column, cursor + row + shift + 1, 1)
+                cursor += scaled_width
+                continue
             glyph, advance = font.glyph(character)
             # Glyph cells overlap vertically between tightly spaced lines.
             # Keep zero pixels transparent so they do not erase earlier text.
-            plane.blit(glyph, physical_x, cursor, 0)
+            if italic:
+                # The packed glyph is rotated; its x coordinate corresponds
+                # to vertical screen position. Shift higher pixels right.
+                for column in range(font.line_height):
+                    shift = column // 8
+                    for row in range(advance):
+                        if glyph.pixel(column, row):
+                            plane.pixel(physical_x + column, cursor + row + shift, 1)
+                            if bold:
+                                plane.pixel(physical_x + column, cursor + row + shift + 1, 1)
+            else:
+                plane.blit(glyph, physical_x, cursor, 0)
+                if bold:
+                    plane.blit(glyph, physical_x, cursor + 1, 0)
             cursor += advance
+
+    def text_ccw(self, text, x, y, scale=1, color=BLACK, font=None):
+        """Draw one word rotated 90 degrees counterclockwise."""
+        text = str(text)
+        font = font or (HACK16 if scale == 1 else HACK24)
+        width = font.measure(text)
+        physical_x = PHYSICAL_WIDTH - y - width
+        cursor = 0
+        for character in text:
+            glyph, advance = font.glyph(character)
+            for glyph_x in range(advance):
+                for glyph_y in range(font.line_height):
+                    if glyph.pixel(font.line_height - 1 - glyph_y, glyph_x):
+                        self.black.pixel(physical_x + cursor + glyph_x, x + glyph_y, 0 if color == WHITE else 1)
+            cursor += advance
+
+    def styled_text(self, runs, x, y, font):
+        """Draw adjacent styled runs after shared wrapping and positioning."""
+        for text, style in runs:
+            self.text(text, x, y, font=font, bold=bool(style.get('b')),
+                      italic=bool(style.get('i')), small_caps=bool(style.get('s')))
+            width = (sum(max(1, (font.measure(c.upper()) * 3 + 3) // 4) if 'a' <= c <= 'z' else font.measure(c) for c in text)
+                     if style.get('s') else font.measure(text))
+            if style.get('u'):
+                self.fill_rect(x, y + font.line_height - 1, width, 1)
+            x += width
 
     def wordmark(self, x, y):
         if y & 7:
@@ -248,7 +304,7 @@ class PortraitCanvas:
         if current:
             lines.append(current)
 
-        line_height = font.line_height + line_gap
+        line_height = ((font.line_height + line_gap + 7) // 8) * 8
         for index, line in enumerate(lines):
             self.text(line, x, y + index * line_height, scale, color, width, font)
         return len(lines) * line_height
@@ -278,6 +334,7 @@ class PocketReaderApp(BaseApp):
         self._reading_turns = 0
         self._reading_qualified = False
         self._download_led_count = -1
+        self._download_percent = None
         self._download_task = None
         self._download_active = False
         self._reading_refresh_pending = False
@@ -318,6 +375,7 @@ class PocketReaderApp(BaseApp):
         self._settings_menu = False
         self._settings_cursor = 0
         self._led_menu = False
+        self._library_menu = False
         self._sort_cursor = 0
         self._settings_inline = None
         self._settings_row_pending = 0
@@ -490,9 +548,11 @@ class PocketReaderApp(BaseApp):
 
         if self._download_task is not None:
             self._device_idle_since = time.ticks_ms()
-            if getattr(self, '_download_cancellable', False) and PhysicalMenuMinus.pressed():
+            if getattr(self, '_download_cancellable', False) and PhysicalMenuPlus.pressed():
                 self._download_cancellable = False
                 self._download_task.cancel()
+            if self._dirty and self.reader_display.ready():
+                self._draw()
             return
         if self._catalog_task is not None or self._wifi_task is not None:
             self._device_idle_since = time.ticks_ms()
@@ -560,14 +620,17 @@ class PocketReaderApp(BaseApp):
         toc_button_handled = False
         if not setup_button_handled:
             toc_button_handled = self._handle_toc_chord()
+        refresh_button_handled = False
+        if not setup_button_handled and not toc_button_handled:
+            refresh_button_handled = self._handle_library_refresh_chord()
         back_button_handled = self._handle_back_button()
         select_button_handled = False
-        if not setup_button_handled:
+        if not setup_button_handled and not refresh_button_handled:
             select_button_handled = self._handle_select_button()
         sleep_button_handled = False
-        if not setup_button_handled and not toc_button_handled:
+        if not setup_button_handled and not toc_button_handled and not refresh_button_handled:
             sleep_button_handled = self._handle_sleep_button()
-        previous_button_handled = False if toc_button_handled else self._handle_previous_button()
+        previous_button_handled = False if toc_button_handled or refresh_button_handled else self._handle_previous_button()
         if self._setup_requested and self.reader_display.ready():
             self._setup_requested = False
             self._begin_settings(from_chord=True)
@@ -584,6 +647,7 @@ class PocketReaderApp(BaseApp):
             back_button_handled
             or setup_button_handled
             or toc_button_handled
+            or refresh_button_handled
             or select_button_handled
             or sleep_button_handled
             or previous_button_handled
@@ -746,6 +810,42 @@ class PocketReaderApp(BaseApp):
             return True
         return False
 
+    def _handle_library_refresh_chord(self):
+        """Hold Previous and Next in the library to refresh the list."""
+        if self.detail or self._bottom_menu or self._remove_prompt:
+            return False
+        previous, next_button = PhysicalMenuMinus.value, UserB.value
+        if getattr(self, '_library_refresh_suppressed', False):
+            if not previous and not next_button:
+                self._library_refresh_suppressed = False
+                PhysicalMenuMinus._pressed_state = PRESSED_READ
+                UserB._pressed_state = PRESSED_READ
+            return True
+        if previous and next_button:
+            if not getattr(self, '_library_refresh_tracking', False):
+                self._library_refresh_tracking = True
+                self._library_refresh_ready = False
+            self._previous_tracking = False
+            self._sleep_button_tracking = False
+            elapsed = min(PhysicalMenuMinus.pressed_ms(), UserB.pressed_ms())
+            self._update_page_hold_feedback(elapsed)
+            if elapsed >= EXIT_HOLD_MS and not self._library_refresh_ready:
+                self._library_refresh_ready = True
+                self._set_page_hold_feedback('blue')
+            return True
+        if getattr(self, '_library_refresh_tracking', False):
+            self._library_refresh_tracking = False
+            self._clear_page_hold_feedback()
+            if self._library_refresh_ready:
+                self._catalog_pending = True
+                self.update_status = 'REFRESHING LIBRARY'
+                self._dirty = True
+                self._small_update = False
+            self._library_refresh_ready = False
+            self._library_refresh_suppressed = True
+            return True
+        return False
+
     def _handle_toc_chord(self):
         """Hold physical Previous and Next together to show chapter navigation."""
         if not self.detail or self._bookmark_menu:
@@ -851,14 +951,19 @@ class PocketReaderApp(BaseApp):
                                 book_library.add_bookmark(self.reader.entry["id"], word)
                                 self.update_status = "BOOKMARK SAVED"
                             self._bookmarks = book_library.bookmarks(self.reader.entry["id"])
+                            self._small_update = True
+                            self._bookmark_partial = (self.reader.entry['id'], self.current_page)
                         except Exception as exc:
                             self.update_status = "BOOKMARK ERROR: " + str(exc)
                     self._dirty = True
                 elif self._remove_prompt:
                     if self._remove_yes:
                         try:
-                            book_library.remove_download(self.books[self.selected])
-                            self.update_status = "DOWNLOAD REMOVED"
+                            entry = self.books[self.selected]
+                            redownloadable = self._can_redownload(entry)
+                            book_library.remove_download(entry)
+                            self._load_cached_catalog()
+                            self.update_status = "DOWNLOAD REMOVED" if redownloadable else "BOOK REMOVED"
                         except Exception as exc:
                             self.update_status = "REMOVE ERROR: " + str(exc)
                     self._remove_prompt = False
@@ -934,8 +1039,7 @@ class PocketReaderApp(BaseApp):
             return True
         if self._remove_prompt:
             self._remove_yes = not self._remove_yes
-            self._dirty = True
-            self._small_update = True
+            self._update_remove_choices()
             return True
         if self._bottom_menu:
             self._bottom_choice = (self._bottom_choice - 1) % 2
@@ -968,8 +1072,7 @@ class PocketReaderApp(BaseApp):
             return
         if self._remove_prompt:
             self._remove_yes = not self._remove_yes
-            self._dirty = True
-            self._small_update = True
+            self._update_remove_choices()
             return
         if self._bottom_menu:
             self._bottom_choice = (self._bottom_choice + 1) % 2
@@ -986,8 +1089,34 @@ class PocketReaderApp(BaseApp):
             return
         self._move_selection(1)
 
+    def _draw_remove_choices(self, canvas):
+        canvas.fill_rect(100, 432, 460, 48, WHITE)
+        canvas.text("[ YES ]" if self._remove_yes else "  YES  ", 130, 440, 2, BLACK, 180)
+        canvas.text("  NO  " if self._remove_yes else "[ NO ]", 375, 440, 2, BLACK, 180)
+
+    def _update_remove_choices(self):
+        if (not self._dirty and getattr(self, '_drawn_screen', None) == ('remove',)
+                and self.reader_display.ready()):
+            canvas = PortraitCanvas(display.black, display.red)
+            self._draw_remove_choices(canvas)
+            self.reader_display.queue_frame(partial=True)
+        else:
+            self._dirty = True
+            self._small_update = True
+
     def _move_selection(self, step):
-        had_error = getattr(self, 'update_status', '').startswith('BOOK ERROR:') or getattr(self, 'update_status', '').startswith('LIBRARY UNAVAILABLE:')
+        had_error = getattr(self, 'update_status', '').startswith('BOOK ERROR:') or getattr(self, 'update_status', '').startswith('LIBRARY UNAVAILABLE:') or getattr(self, 'update_status', '').startswith('REMOVE ERROR:')
+        if not had_error and book_library.library_auto_page_enabled():
+            last_page = max(0, (len(self.all_books) - 1) // REFRESH_ROW)
+            if step > 0 and self.selected == REFRESH_ROW and self._bottom_choice == 1 and self.library_page < last_page:
+                self._move_library_page(1)
+                return
+            if step < 0 and self.selected == 0 and self.library_page > 0:
+                self._move_library_page(-1)
+                self.selected = len(self.books) - 1 if self.books else REFRESH_ROW
+                self._bottom_choice = 0
+                self._show_selection_led()
+                return
         slots = [(index, 0) for index in range(len(self.books))] + [(REFRESH_ROW, 0), (REFRESH_ROW, 1)]
         try:
             current = slots.index((self.selected, self._bottom_choice if self.selected == REFRESH_ROW else 0))
@@ -1031,6 +1160,9 @@ class PocketReaderApp(BaseApp):
                 self._draw_footer_border(canvas, self._bottom_choice, True)
             else:
                 self._draw_book_border(canvas, self.selected, True, clear=True)
+            recent_row = getattr(self, '_drawn_recent_row', None)
+            if recent_row is not None and recent_row in (previous, self.selected):
+                self._draw_recent_badge(canvas, LIBRARY_ROW_Y + recent_row * LIBRARY_ROW_HEIGHT)
             self.reader_display.queue_frame(partial=True)
             self._drawn_library_selection = self.selected
             self._drawn_library_choice = self._bottom_choice
@@ -1046,7 +1178,9 @@ class PocketReaderApp(BaseApp):
         books = list(catalog.get("books", []))
         books = [entry for entry in books if book_library.has_download(entry)]
         known_remote = {entry.get('id') for entry in books}
-        for item in starter_library.load_catalog():
+        starter_entries = starter_library.load_catalog()
+        self._available_library_ids = {item.get('id') for item in starter_entries if item.get('id')}
+        for item in starter_entries:
             if item.get('id') not in known_remote:
                 item = dict(item)
                 item['package'] = item['id'] + '.prb'
@@ -1064,6 +1198,9 @@ class PocketReaderApp(BaseApp):
         self._show_library_page()
         if self.selected != REFRESH_ROW and self.selected >= len(self.books):
             self.selected = 0 if self.books else REFRESH_ROW
+
+    def _can_redownload(self, entry):
+        return entry.get('id') in getattr(self, '_available_library_ids', ())
 
     def _show_library_page(self):
         start = self.library_page * REFRESH_ROW
@@ -1095,6 +1232,8 @@ class PocketReaderApp(BaseApp):
             self._download_task = None
             return
         wifi_setup.begin_operation()
+        indexing = False
+        stage = 'PREPARING'
         try:
             saved = book_library.load_progress().get(entry["id"], {})
             previous_word = int(saved.get("word", 0))
@@ -1117,6 +1256,7 @@ class PocketReaderApp(BaseApp):
                     if old:
                         old.close()
             if entry.get('_starter') and not book_library.has_download(entry):
+                stage = 'DOWNLOADING'
                 self._download_cancellable = True
                 try:
                     await self._download_starter_book(entry)
@@ -1139,12 +1279,16 @@ class PocketReaderApp(BaseApp):
             if book_library.has_download(entry):
                 entry = dict(entry)
                 entry["sha256"] = book_library.installed_state().get(entry["id"], {}).get("sha256")
+            stage = 'OPENING'
             self.reader = book_library.BookPackage(entry)
             reader_size = book_library.text_size()
             reader_family = book_library.font_family()
+            indexing = True
+            stage = 'INDEXING'
             needs_index = not self.reader.has_index(reader_size, reader_family)
             animation = None
             if needs_index:
+                await self._show_download_status('PREPARING ' + entry['title'])
                 self._download_active = True
                 animation = aio.create_task(self._animate_download((0, 0, 2)))
             try:
@@ -1155,6 +1299,7 @@ class PocketReaderApp(BaseApp):
                 if animation is not None:
                     self._download_active = False
                     await animation
+            indexing = False
             self._chapters = self.reader.chapters()
             saved_word = previous_word
             if legacy_excerpt and self.reader.header.get("schema") in (2, 3, 4):
@@ -1166,6 +1311,12 @@ class PocketReaderApp(BaseApp):
                 if int(page_info[2]) > saved_word:
                     break
                 self.current_page = page_index
+            if self.reader.header.get('schema') == 5 and saved_word == previous_word:
+                # Several footnote-only continuation pages can share a word
+                # offset. Preserve the exact saved page when its index matches.
+                saved_page = int(saved.get('page', -1))
+                if 0 <= saved_page < len(self.reader.pages) and int(self.reader.pages[saved_page][2]) == saved_word:
+                    self.current_page = saved_page
             self.detail = True
             book_transfer.set_open_book(entry["id"])
             book_library.save_progress(entry["id"], self.current_page,
@@ -1182,6 +1333,19 @@ class PocketReaderApp(BaseApp):
             self._dirty = True
             self.update_status = "NO CHAPTER INDEX" if self._reading_light_mode == "chapter" and not self._chapters else ""
             leds.clear()
+        except MemoryError:
+            # Drop page lists and note caches before collecting so the badge
+            # can show an actionable error instead of staying unresponsive.
+            if self.reader:
+                self.reader.pages = []
+                self.reader._compact_notes = {}
+                self.reader._compact_page_details = {}
+            self._close_reader()
+            gc.collect()
+            self.update_status = ('BOOK ERROR: NOT ENOUGH MEMORY TO INDEX. USE THE DESKTOP APP TO GENERATE THE INDEX. RESTART THE BADGE IF IT REMAINS SLOW.'
+                                  if indexing else 'BOOK ERROR: NOT ENOUGH MEMORY TO OPEN THIS BOOK.')
+            self._dirty = True
+            self._show_selection_led()
         except aio.CancelledError:
             self._close_reader()
             self.update_status = "DOWNLOAD CANCELED"
@@ -1189,11 +1353,22 @@ class PocketReaderApp(BaseApp):
             self._show_selection_led()
         except Exception as exc:
             self._close_reader()
-            self.update_status = "BOOK ERROR: " + str(exc)
+            error_code = getattr(exc, 'errno', None)
+            if error_code is None and getattr(exc, 'args', None):
+                error_code = exc.args[0]
+            name = type(exc).__name__
+            if isinstance(exc, OSError) and error_code == 28:
+                detail = 'NOT ENOUGH SPACE. FREE SPACE AND RETRY.'
+            elif name == 'TimeoutError':
+                detail = 'CONNECTION TIMED OUT. CHECK WI-FI AND RETRY.'
+            else:
+                detail = str(exc).strip() or name
+            self.update_status = 'BOOK ERROR: ' + stage + ': ' + detail
             self._dirty = True
             self._show_selection_led()
         finally:
             wifi_setup.end_operation()
+            self._download_percent = None
             self._download_task = None
 
     async def _show_download_status(self, message):
@@ -1237,12 +1412,13 @@ class PocketReaderApp(BaseApp):
         try:
             temporary_connection = await self._connect_starter_wifi()
             await self._show_download_status('DOWNLOADING ' + entry['title'])
+            self._download_percent = 0
             self._download_active = True
             animation = aio.create_task(self._animate_download())
             try:
                 # Let the first light appear before beginning the transfer.
                 await aio.sleep_ms(0)
-                await starter_library.download(entry)
+                await starter_library.download(entry, progress=self._show_download_progress)
                 download_complete = True
                 self._download_cancellable = False
             finally:
@@ -1273,6 +1449,7 @@ class PocketReaderApp(BaseApp):
         wifi_setup.begin_operation()
         temporary_connection = False
         try:
+            await self._show_download_status('REFRESHING LIBRARY')
             if starter_library.enabled():
                 temporary_connection = await self._connect_starter_wifi()
                 await starter_library.refresh()
@@ -1280,7 +1457,11 @@ class PocketReaderApp(BaseApp):
             self.update_status = "LIBRARY UPDATED"
         except Exception as exc:
             self._load_cached_catalog()
-            self.update_status = "LIBRARY UNAVAILABLE: " + str(exc)
+            error = str(exc).strip() or type(exc).__name__
+            prefix = 'Starter library unavailable: '
+            if error.startswith(prefix):
+                error = error[len(prefix):]
+            self.update_status = "LIBRARY UNAVAILABLE: " + error
         finally:
             if temporary_connection:
                 wifi_setup.turn_off(remember=False)
@@ -1308,17 +1489,12 @@ class PocketReaderApp(BaseApp):
             await aio.sleep_ms(150)
 
     def _show_download_progress(self, received, total):
-        """Fill the portrait LED column from top to bottom as bytes arrive."""
-        count = min(len(ROW_LED_MAP), received * len(ROW_LED_MAP) // total)
-        if count == self._download_led_count:
-            return
-        self._download_led_count = count
-        leds.pause()
-        level = self._light_level()
-        dim = max(1, level // 2) if level else 0
-        for index, led_index in enumerate(ROW_LED_MAP):
-            leds[led_index] = (0, 0, level) if index < count else (0, 0, dim)
-        leds.write()
+        """Request a screen update when the transfer percentage changes."""
+        percent = min(100, received * 100 // total) if total else 0
+        if percent != self._download_percent:
+            self._download_percent = percent
+            self._dirty = True
+            self._small_update = True
 
     def _show_connecting(self):
         leds.pause()
@@ -1462,7 +1638,7 @@ class PocketReaderApp(BaseApp):
                 if not self.update_status.startswith("WIFI ERROR:"):
                     self.update_status = ""
                 self._settings_menu = True
-                self._settings_cursor = 5
+                self._settings_cursor = 4
                 self._show_settings_led()
             self._dirty = True
             return
@@ -1546,14 +1722,6 @@ class PocketReaderApp(BaseApp):
                 self._begin_setup()
                 return
             self.update_status = "WAIT FOR DISPLAY"
-        elif self._wifi_main_items()[self._wifi_cursor][0] == 'starter':
-            starter_library.set_enabled(not starter_library.enabled())
-            self._load_cached_catalog()
-            if starter_library.enabled():
-                self._catalog_pending = True
-                self.update_status = "CONNECT WIFI TO UPDATE LIBRARY"
-            else:
-                self.update_status = "STARTER LIBRARY OFF"
         elif self._wifi_main_items()[self._wifi_cursor][0] == 'login':
             self._wifi_view = 'login'
         else:
@@ -1572,12 +1740,11 @@ class PocketReaderApp(BaseApp):
         return len(self._wifi_main_items())
 
     def _wifi_main_items(self):
-        # Starter library and login occupy the last two rows.
-        items = [('hotspot', None)] + [('network', item) for item in self._wifi_networks[:5]]
-        while len(items) < 6:
+        items = [('hotspot', None)] + [('network', item) for item in self._wifi_networks[:6]]
+        while len(items) < 7:
             items.append(None)
-        items.extend((('starter', None), ('login', None)))
-        items.extend(('network', item) for item in self._wifi_networks[5:])
+        items.append(('login', None))
+        items.extend(('network', item) for item in self._wifi_networks[6:])
         return items
 
     def _menu_snapshot(self):
@@ -1593,7 +1760,7 @@ class PocketReaderApp(BaseApp):
                 return (('settings', 'font'), self._font_cursor)
             if self._family_options_menu:
                 return (('settings', 'family'), self._family_cursor)
-            view = 'led' if getattr(self, '_led_menu', False) else 'main'
+            view = 'led' if getattr(self, '_led_menu', False) else 'library' if getattr(self, '_library_menu', False) else 'main'
             return (('settings', view), self._settings_cursor)
         if self._toc_menu and self._chapters:
             return (('toc', self._toc_cursor // 8), self._toc_cursor % 8)
@@ -1645,8 +1812,6 @@ class PocketReaderApp(BaseApp):
             if self._wifi_menu and self._dirty and self.reader_display.ready():
                 self._draw()
             await wifi_setup.connect_saved(ssid, duration, self._update_wifi_indicator)
-            if starter_library.enabled() and self._catalog_task is None:
-                self._catalog_pending = True
             if self.update_status.startswith("CONNECTING ") or self.update_status.startswith("CONNECTED "):
                 self.update_status = ""
         except Exception as exc:
@@ -1876,6 +2041,7 @@ class PocketReaderApp(BaseApp):
         self._settings_menu = True
         self._settings_cursor = 0
         self._led_menu = False
+        self._library_menu = False
         self._settings_inline = None
         self._settings_row_pending = 0
         self._sleep_options_menu = False
@@ -1895,7 +2061,7 @@ class PocketReaderApp(BaseApp):
         cursor = self._sleep_cursor if self._sleep_options_menu else (self._font_cursor if self._font_options_menu else (self._family_cursor if self._family_options_menu else self._settings_cursor))
         level = self._light_level()
         if self._availability_lights and level:
-            count = 3 if self._family_options_menu else (4 if self._sleep_options_menu or self._font_options_menu or getattr(self, '_led_menu', False) else 8)
+            count = 3 if self._family_options_menu else (4 if self._sleep_options_menu or self._font_options_menu or getattr(self, '_led_menu', False) else (4 if getattr(self, '_library_menu', False) else 7))
             for index in range(count):
                 leds[ROW_LED_MAP[index]] = (0, 0, level)
         leds[ROW_LED_MAP[cursor]] = (level, level, level)
@@ -1935,7 +2101,7 @@ class PocketReaderApp(BaseApp):
             return
         if PhysicalMenuPlus.pressed():
             if self._settings_inline:
-                row = {'size': 0, 'family': 1, 'sort': 3}[self._settings_inline]
+                row = {'size': 1, 'family': 0, 'sort': 0}[self._settings_inline]
                 self._settings_inline = None
                 self._queue_settings_rows(row)
                 self._flush_settings_rows()
@@ -1948,6 +2114,10 @@ class PocketReaderApp(BaseApp):
             elif getattr(self, '_led_menu', False):
                 self._led_menu = False
                 self._settings_cursor = 2
+                self._show_settings_led()
+            elif getattr(self, '_library_menu', False):
+                self._library_menu = False
+                self._settings_cursor = 3
                 self._show_settings_led()
             else:
                 self._settings_menu = False
@@ -1967,13 +2137,13 @@ class PocketReaderApp(BaseApp):
         if step:
             if self._settings_inline == 'size':
                 self._font_cursor = (self._font_cursor + step) % 4
-                self._queue_settings_rows(0)
+                self._queue_settings_rows(1)
             elif self._settings_inline == 'family':
                 self._family_cursor = (self._family_cursor + step) % 3
-                self._queue_settings_rows(1)
+                self._queue_settings_rows(0)
             elif self._settings_inline == 'sort':
                 self._sort_cursor = (self._sort_cursor + step) % 5
-                self._queue_settings_rows(3)
+                self._queue_settings_rows(0)
             elif self._sleep_options_menu:
                 self._sleep_cursor = (self._sleep_cursor + step) % len(LIGHT_SLEEP_OPTIONS)
             elif self._font_options_menu:
@@ -1981,7 +2151,8 @@ class PocketReaderApp(BaseApp):
             elif self._family_options_menu:
                 self._family_cursor = (self._family_cursor + step) % 3
             else:
-                self._settings_cursor = (self._settings_cursor + step) % (4 if getattr(self, '_led_menu', False) else 8)
+                count = 4 if getattr(self, '_led_menu', False) else (4 if getattr(self, '_library_menu', False) else 7)
+                self._settings_cursor = (self._settings_cursor + step) % count
             if not self._settings_inline:
                 self._show_settings_led()
                 self._menu_selection_changed()
@@ -1990,7 +2161,7 @@ class PocketReaderApp(BaseApp):
             if self._settings_inline == 'size':
                 book_library.set_text_size(('small', 'medium', 'large', 'xl')[self._font_cursor])
                 self._settings_inline = None
-                self._queue_settings_rows(0)
+                self._queue_settings_rows(1)
             elif self._settings_inline == 'family':
                 book_library.set_font_family(('opendyslexic', 'ubuntu', 'tinos')[self._family_cursor])
                 self._settings_inline = None
@@ -2002,7 +2173,7 @@ class PocketReaderApp(BaseApp):
                 book_library.set_library_sort_settings(('title', 'author_first', 'author_last', 'added', 'opened')[self._sort_cursor], grouped)
                 self._settings_inline = None
                 self._load_cached_catalog()
-                self._queue_settings_rows(3)
+                self._queue_settings_rows(0)
             elif self._sleep_options_menu:
                 self._idle_light_minutes = LIGHT_SLEEP_OPTIONS[self._sleep_cursor]
                 book_library.set_idle_light_minutes(self._idle_light_minutes)
@@ -2040,13 +2211,34 @@ class PocketReaderApp(BaseApp):
                 self._sleep_options_menu = True
                 self._show_settings_led()
                 full_refresh = True
-            elif self._settings_cursor == 0:
-                self._font_cursor = ("small", "medium", "large", "xl").index(book_library.text_size())
-                self._settings_inline = 'size'
+            elif getattr(self, '_library_menu', False) and self._settings_cursor == 0:
+                order, _ = book_library.library_sort_settings()
+                self._sort_cursor = ('title', 'author_first', 'author_last', 'added', 'opened').index(order)
+                self._settings_inline = 'sort'
                 self._queue_settings_rows(0)
-            elif self._settings_cursor == 1:
+            elif getattr(self, '_library_menu', False) and self._settings_cursor == 1:
+                order, grouped = book_library.library_sort_settings()
+                book_library.set_library_sort_settings(order, not grouped)
+                self._load_cached_catalog()
+                self._queue_settings_rows(1)
+            elif getattr(self, '_library_menu', False) and self._settings_cursor == 2:
+                starter_library.set_enabled(not starter_library.enabled())
+                self._load_cached_catalog()
+                if starter_library.enabled():
+                    self.update_status = 'USE REFRESH LIST TO UPDATE LIBRARY'
+                else:
+                    self.update_status = 'STARTER LIBRARY OFF'
+                self._queue_settings_rows(2)
+            elif getattr(self, '_library_menu', False):
+                book_library.set_library_auto_page_enabled(not book_library.library_auto_page_enabled())
+                self._queue_settings_rows(3)
+            elif self._settings_cursor == 0:
                 self._family_cursor = ('opendyslexic', 'ubuntu', 'tinos').index(book_library.font_family())
                 self._settings_inline = 'family'
+                self._queue_settings_rows(0)
+            elif self._settings_cursor == 1:
+                self._font_cursor = ('small', 'medium', 'large', 'xl').index(book_library.text_size())
+                self._settings_inline = 'size'
                 self._queue_settings_rows(1)
             elif self._settings_cursor == 2:
                 self._led_menu = True
@@ -2054,29 +2246,25 @@ class PocketReaderApp(BaseApp):
                 self._show_settings_led()
                 full_refresh = True
             elif self._settings_cursor == 3:
-                order, _ = book_library.library_sort_settings()
-                self._sort_cursor = ('title', 'author_first', 'author_last', 'added', 'opened').index(order)
-                self._settings_inline = 'sort'
-                self._queue_settings_rows(3)
+                self._library_menu = True
+                self._settings_cursor = 0
+                self._settings_row_pending = 0
+                self._show_settings_led()
+                full_refresh = True
             elif self._settings_cursor == 4:
-                order, grouped = book_library.library_sort_settings()
-                book_library.set_library_sort_settings(order, not grouped)
-                self._load_cached_catalog()
-                self._queue_settings_rows(4)
-            elif self._settings_cursor == 5:
                 self._settings_menu = False
                 self._begin_wifi_menu()
                 return
-            elif self._settings_cursor == 7:
+            elif self._settings_cursor == 6:
                 self._sleep_timer_minutes = DEVICE_SLEEP_OPTIONS[(DEVICE_SLEEP_OPTIONS.index(self._sleep_timer_minutes) + 1) % len(DEVICE_SLEEP_OPTIONS)]
                 book_library.set_sleep_timer_minutes(self._sleep_timer_minutes)
                 self._device_idle_since = time.ticks_ms()
-                self._queue_settings_rows(7)
+                self._queue_settings_rows(6)
             else:
                 self._quick_boot_enabled = not self._quick_boot_enabled
                 book_library.set_quick_boot_enabled(self._quick_boot_enabled)
                 self.reader_display.quick_boot = self._quick_boot_enabled
-                self._queue_settings_rows(6)
+                self._queue_settings_rows(5)
             if full_refresh:
                 self._dirty = True
                 self._small_update = False
@@ -2150,7 +2338,8 @@ class PocketReaderApp(BaseApp):
         self._battery_candidate = None
         self._battery_candidate_count = 0
         canvas = PortraitCanvas(display.black, display.red)
-        canvas.fill_rect(PORTRAIT_WIDTH - 48, 0, 48, 56, WHITE)
+        canvas.fill_rect(PORTRAIT_WIDTH - 72, 0, 72, 56, WHITE)
+        self._draw_wifi_indicator(canvas)
         self._draw_battery(canvas)
         self.reader_display.queue_frame(partial=True)
         return True
@@ -2162,13 +2351,13 @@ class PocketReaderApp(BaseApp):
         percent = self._battery_percent
         if percent is None:
             label = "USB" if self._battery_usb else "?"
-            canvas.text(label, PORTRAIT_WIDTH - 6 - HACK16.measure(label), y + 16, 1, BLACK, 40)
+            canvas.text(label, PORTRAIT_WIDTH - 6 - HACK24.measure(label), y + 16, 2, BLACK, 80)
             return
         count = 0 if percent < 5 else min(4, (percent - 1) // 25 + 1)
         for index in range(count):
             canvas.fill_rect(x + 2 + index * 7, y + 3, 5, 10, BLACK)
         label = "{}%".format(percent)
-        canvas.text(label, PORTRAIT_WIDTH - 6 - HACK16.measure(label), y + 16, 1, BLACK, 40)
+        canvas.text(label, PORTRAIT_WIDTH - 6 - HACK24.measure(label), y + 16, 2, BLACK, 80)
 
     def _draw_wifi_indicator(self, canvas):
         active, connected = wifi_setup.radio_status()
@@ -2192,6 +2381,7 @@ class PocketReaderApp(BaseApp):
             canvas = PortraitCanvas(display.black, display.red)
             canvas.fill_rect(598, 0, 30, 40, WHITE)
             self._draw_wifi_indicator(canvas)
+            self._draw_battery(canvas)
             self.reader_display.queue_frame(partial=True)
             return True
         except Exception:
@@ -2205,6 +2395,7 @@ class PocketReaderApp(BaseApp):
             if self._font_options_menu: return ('settings', 'size')
             if self._family_options_menu: return ('settings', 'family')
             if getattr(self, '_led_menu', False): return ('settings', 'led')
+            if getattr(self, '_library_menu', False): return ('settings', 'library')
             return ('settings', 'main')
         if self._toc_menu:
             return ('toc', self._toc_cursor // 8)
@@ -2259,32 +2450,35 @@ class PocketReaderApp(BaseApp):
             self._reading_refresh_pending = False
         else:
             self._library_refresh_pending = True
-        # Experiment with differential updates for library selection changes.
-        self.reader_display.queue_frame(partial=self._small_update and not self.detail and not self._wifi_menu)
+        # Bookmarks change only the ribbon/status, not the page contents.
+        bookmark_partial = (self.detail and self.reader and
+                            getattr(self, '_bookmark_partial', None) == (self.reader.entry['id'], self.current_page))
+        self.reader_display.queue_frame(partial=self._small_update and (not self.detail or bookmark_partial) and not self._wifi_menu)
         self._drawn_screen = screen
+        self._bookmark_partial = False
         self._small_update = False
         self._dirty = False
 
     def _draw_navigation_hints(self, canvas, reader=False):
-        canvas.rect(4, 4, 60, 44, 1, BLACK)
-        canvas.rect(68, 4, 60, 44, 1, BLACK)
-        canvas.text("MENU-", 8, 8, 1, BLACK, 52)
-        first_hint = "PREV" if reader else ("STOP" if getattr(self, '_download_cancellable', False) else "UP")
-        canvas.text(first_hint, 8, 24, 1, BLACK, 52)
-        canvas.text("USR-B", 72, 8, 1, BLACK, 52)
-        canvas.text("NEXT" if reader else "DOWN", 72, 24, 1, BLACK, 52)
+        canvas.rect(4, 4, 64, 44, 1, BLACK)
+        canvas.rect(72, 4, 64, 44, 1, BLACK)
+        canvas.text("MENU-", 8, 8, 1, BLACK, 56)
+        first_hint = "PREV" if reader else "UP"
+        canvas.text(first_hint, 8, 24, 1, BLACK, 56)
+        canvas.text("USR-B", 76, 8, 1, BLACK, 56)
+        canvas.text("NEXT" if reader else "DOWN", 76, 24, 1, BLACK, 56)
         if reader:
             canvas.text("HOLD BOTH FOR TOC", 4, 48, 1, BLACK, 170)
 
     def _draw_bottom_hints(self, canvas, reader=False):
-        canvas.rect(4, 912, 60, 44, 1, BLACK)
-        canvas.rect(68, 912, 60, 44, 1, BLACK)
-        canvas.text("MENU+", 8, 920, 1, BLACK, 52)
-        canvas.text("LIB" if reader and not self._bookmark_menu and not self._toc_menu else "CANCL", 8, 936, 1, BLACK, 52)
-        canvas.text("USR-A", 72, 920, 1, BLACK, 52)
-        canvas.text("BKMRK" if reader and not self._bookmark_menu and not self._toc_menu else "SLCT", 72, 936, 1, BLACK, 52)
+        canvas.rect(4, 916, 64, 44, 1, BLACK)
+        canvas.rect(72, 916, 64, 44, 1, BLACK)
+        canvas.text("MENU+", 8, 920, 1, BLACK, 56)
+        canvas.text("LIB" if reader and not self._bookmark_menu and not self._toc_menu else "CANCL", 8, 936, 1, BLACK, 56)
+        canvas.text("USR-A", 76, 920, 1, BLACK, 56)
+        canvas.text("BKMRK" if reader and not self._bookmark_menu and not self._toc_menu else "SLCT", 76, 936, 1, BLACK, 56)
         if reader and not self._bookmark_menu and not self._toc_menu:
-            canvas.text("HOLD FOR LIST", 134, 936, 1, BLACK, 160)
+            canvas.text("HOLD BKMRK FOR LIST", 144, 936, 1, BLACK, 360)
 
     def _draw_book_state_icon(self, canvas, x, y, downloaded):
         if downloaded:
@@ -2316,7 +2510,11 @@ class PocketReaderApp(BaseApp):
     def _draw_footer_border(self, canvas, choice, selected):
         label, x = (("REFRESH LIST", 36), ("SETTINGS", 260))[choice]
         y = LIBRARY_ROW_Y + REFRESH_ROW * LIBRARY_ROW_HEIGHT
-        canvas.rect(x - 4, y, HACK16.measure(label) + 8, 34, 2, BLACK if selected else WHITE)
+        canvas.rect(x - 4, y + 4, HACK24.measure(label) + 8, 40, 2, BLACK if selected else WHITE)
+
+    def _draw_recent_badge(self, canvas, y):
+        canvas.fill_rect(615, y, 24, LIBRARY_FRAME_HEIGHT, BLACK)
+        canvas.text_ccw("RECENT", 618, y + max(0, (LIBRARY_FRAME_HEIGHT - HACK16.measure("RECENT")) // 2), 1, WHITE)
 
     def _draw_library(self, canvas):
         self._draw_navigation_hints(canvas)
@@ -2328,14 +2526,25 @@ class PocketReaderApp(BaseApp):
         # glyphs align with the optimized driver's native framebuffer bytes.
         row_y = LIBRARY_ROW_Y
         row_height = LIBRARY_ROW_HEIGHT
-        progress_state = book_library.load_progress()
+        progress_state = book_library.load_progress([entry.get('id') for entry in self.books])
+        installed_state = book_library.installed_state()
+        row_status = ''
+        if getattr(self, '_download_task', None) is not None and self.selected < len(self.books):
+            if self.update_status.startswith('DOWNLOADING '):
+                row_status = 'DOWNLOADING'
+            elif self.update_status.startswith('CONNECTING '):
+                row_status = 'CONNECTING'
+            elif self.update_status.startswith('PREPARING '):
+                row_status = 'PREPARING'
         recent = book_library.most_recent_read(self.all_books)
         if recent is not None:
             recent -= self.library_page * REFRESH_ROW
+        self._drawn_recent_row = recent if recent is not None and 0 <= recent < len(self.books) else None
         for index, entry in enumerate(self.books):
             title = entry.get("title", "Untitled")
             author = entry.get("author", "Unknown Author")
-            installed = "package" in entry and book_library.has_download(entry)
+            installed = ("package" in entry and entry.get("id") in installed_state
+                         and book_library._exists(book_library.package_path(entry)))
             saved = progress_state.get(entry.get("id"), {})
             word_count = max(1, int(entry.get("word_count", 1)))
             percent = min(100, int(int(saved.get("word", 0)) * 100 / word_count))
@@ -2352,40 +2561,55 @@ class PocketReaderApp(BaseApp):
                 canvas.fill_rect(42 + dx, tile_y + dy, 2, 2, BLACK)
             self._draw_book_state_icon(canvas, 42, tile_y, installed)
             canvas.text(title, 118, y + 8, 2, BLACK, 490)
-            canvas.text(author, 118, y + 48, 1, BLACK, 340 if index == recent else 380)
-            canvas.text(progress, 470 if index == recent else 522, y + 48, 1, RED, 54)
+            progress_x = 558 if index == recent else 590
+            if row_status and index == self.selected:
+                if row_status == 'DOWNLOADING':
+                    percent_x = progress_x - 12 - HACK16.measure('100%')
+                    status_x = percent_x - 8 - HACK16.measure(row_status)
+                    canvas.text(author, 118, y + 48, 1, BLACK, max(0, status_x - 126))
+                    canvas.text(row_status, status_x, y + 48, 1, BLACK, HACK16.measure(row_status))
+                    canvas.text('{}%'.format(self._download_percent or 0), percent_x, y + 48, 1, BLACK,
+                                HACK16.measure('100%'))
+                else:
+                    status_x = progress_x - 12 - HACK16.measure(row_status)
+                    canvas.text(author, 118, y + 48, 1, BLACK, max(0, status_x - 126))
+                    canvas.text(row_status, status_x, y + 48, 1, BLACK, HACK16.measure(row_status))
+            else:
+                canvas.text(author, 118, y + 48, 1, BLACK, 350 if index == recent else 430)
+            canvas.text(progress, progress_x, y + 48, 1, RED, 50)
             if index == recent:
-                canvas.text("RECENT", 536, y + 48, 1, BLACK, 72)
+                self._draw_recent_badge(canvas, y)
 
         y = row_y + REFRESH_ROW * row_height
         labels = (("REFRESH LIST", 36), ("SETTINGS", 260))
         for index, (label, x) in enumerate(labels):
             if self.selected == REFRESH_ROW and index == self._bottom_choice:
                 self._draw_footer_border(canvas, index, True)
-            canvas.text(label, x, y + 8, 1, BLACK, 210)
+            canvas.text(label, x, y + 8, 2, BLACK, 210)
 
-        show_error = self.update_status.startswith('BOOK ERROR:') or self.update_status.startswith('LIBRARY UNAVAILABLE:')
+        show_error = self.update_status.startswith('BOOK ERROR:') or self.update_status.startswith('LIBRARY UNAVAILABLE:') or self.update_status.startswith('REMOVE ERROR:')
         if show_error and not self._remove_prompt:
             canvas.fill_rect(64, 328, 544, 240, WHITE)
             canvas.rect(64, 328, 544, 240, 3, BLACK)
             canvas.wrapped_text(self.update_status, 80, 352, 512, 1, BLACK, line_gap=0)
             canvas.text('UP/DOWN TO DISMISS', 80, 536, 1, BLACK, 512)
+        if getattr(self, '_catalog_task', None) is not None and not show_error:
+            canvas.fill_rect(75, 350, 530, 160, WHITE)
+            canvas.rect(75, 350, 530, 160, 3, BLACK)
+            canvas.text("REFRESHING LIBRARY", 100, 408, 2, BLACK, 480)
         if self._remove_prompt:
             canvas.fill_rect(75, 350, 530, 160, WHITE)
             canvas.rect(75, 350, 530, 160, 3, BLACK)
-            canvas.text("REMOVE DOWNLOAD?", 100, 376, 2, BLACK, 480)
-            canvas.text("[ YES ]" if self._remove_yes else "  YES  ", 130, 440, 2, BLACK, 180)
-            canvas.text("  NO  " if self._remove_yes else "[ NO ]", 375, 440, 2, BLACK, 180)
+            label = "REMOVE DOWNLOAD?" if self._can_redownload(self.books[self.selected]) else "REMOVE BOOK?"
+            canvas.text(label, 100, 376, 2, BLACK, 480)
+            self._draw_remove_choices(canvas)
 
         self._draw_bottom_hints(canvas)
         page_count = max(1, (len(self.all_books) + REFRESH_ROW - 1) // REFRESH_ROW)
         page_label = "PAGE {}/{}".format(self.library_page + 1, page_count)
-        page_x = PORTRAIT_WIDTH - 32 - HACK16.measure(page_label)
-        canvas.text(page_label, page_x, y + 8, 1, BLACK, PORTRAIT_WIDTH - 64)
-        if self.update_status and not show_error:
-            canvas.wrapped_text(self.update_status, 134, 912, PORTRAIT_WIDTH - 140,
-                                1, RED, line_gap=0)
-        elif page_count > 1 and not show_error:
+        page_x = PORTRAIT_WIDTH - 32 - HACK24.measure(page_label)
+        canvas.text(page_label, page_x, y + 8, 2, BLACK, PORTRAIT_WIDTH - 64)
+        if page_count > 1 and not show_error:
             canvas.text("HOLD UP/DOWN FOR MORE BOOKS", 134, 936, 1, BLACK,
                         PORTRAIT_WIDTH - 140)
         if not self._remove_prompt and not self._bottom_menu and not show_error:
@@ -2394,7 +2618,7 @@ class PocketReaderApp(BaseApp):
 
     def _draw_settings(self, canvas):
         self._draw_navigation_hints(canvas)
-        title = "TURN OFF LIGHTS" if self._sleep_options_menu else ("TEXT SIZE" if self._font_options_menu else ("FONT" if self._family_options_menu else ("LED SETTINGS" if getattr(self, '_led_menu', False) else "SETTINGS")))
+        title = "TURN OFF LIGHTS" if self._sleep_options_menu else ("TEXT SIZE" if self._font_options_menu else ("FONT" if self._family_options_menu else ("LED SETTINGS" if getattr(self, '_led_menu', False) else "LIBRARY SETTINGS" if getattr(self, '_library_menu', False) else "SETTINGS")))
         canvas.text(title, 240, 24, 2, BLACK, 300)
         self._draw_battery(canvas)
         canvas.fill_rect(32, 84, PORTRAIT_WIDTH - 64, 4, RED)
@@ -2429,7 +2653,7 @@ class PocketReaderApp(BaseApp):
             self._draw_bottom_hints(canvas)
             canvas.text('FONTS VIA NERDFONTS.COM', 390, 936, 1, BLACK, 280)
             return
-        for index in range(4 if getattr(self, '_led_menu', False) else 8):
+        for index in range(4 if getattr(self, '_led_menu', False) else (4 if getattr(self, '_library_menu', False) else 7)):
             self._draw_settings_row(canvas, index)
         if self.update_status:
             canvas.text(self.update_status, 134, 880, 1, RED, 500)
@@ -2440,7 +2664,7 @@ class PocketReaderApp(BaseApp):
     def _draw_settings_row(self, canvas, index):
         row = index
         led_menu = getattr(self, '_led_menu', False)
-        if not led_menu and row == 7:
+        if not led_menu and not getattr(self, '_library_menu', False) and row == 6:
             y = LIBRARY_ROW_Y + row * LIBRARY_ROW_HEIGHT
             canvas.rect(32, y, PORTRAIT_WIDTH - 64, LIBRARY_FRAME_HEIGHT, 3 if self._settings_cursor == row else 1, BLACK)
             timeout = 'NEVER' if not self._sleep_timer_minutes else '{} MIN'.format(self._sleep_timer_minutes)
@@ -2460,7 +2684,7 @@ class PocketReaderApp(BaseApp):
         label = labels[index]
         y = LIBRARY_ROW_Y + row * LIBRARY_ROW_HEIGHT
         canvas.rect(32, y, PORTRAIT_WIDTH - 64, LIBRARY_FRAME_HEIGHT, 3 if self._settings_cursor == row else 1, BLACK)
-        if not led_menu and row == 3:
+        if getattr(self, '_library_menu', False) and row == 0:
             order, _ = book_library.library_sort_settings()
             canvas.text('LIBRARY SORT', 48, y + 8, 2, BLACK, 570)
             choices = (('TITLE', 'title', 48), ('AUTHOR FIRST', 'author_first', 108),
@@ -2474,35 +2698,45 @@ class PocketReaderApp(BaseApp):
                 x, width = ((44, 60), (104, 130), (234, 120), (354, 110), (464, 168))[self._sort_cursor]
                 canvas.rect(x, y + 32, width, 48, 2, BLACK)
             return
-        if not led_menu and row == 4:
+        if getattr(self, '_library_menu', False) and row == 1:
             _, grouped = book_library.library_sort_settings()
-            canvas.text('GROUP BY SERIES', 48, y + 8, 2, BLACK, 570)
-            canvas.text('[X] Group books by series' if grouped else '[ ] Group books by series', 48, y + 40, 1, BLACK, 570)
+            canvas.text('GROUP BY SERIES: ' + ('ON' if grouped else 'OFF'), 48, y + 8, 2, BLACK, 570)
+            canvas.text('Group books by series name', 48, y + 40, 1, BLACK, 570)
             return
-        if not led_menu and row in (2, 5, 6):
-            main_labels = {2: 'LED SETTINGS...', 5: 'WI-FI & INTERNET SETTINGS...', 6: 'QUICK BOOT: ' + ('ON' if self._quick_boot_enabled else 'OFF')}
-            main_descriptions = {2: 'Brightness and progress indicators', 5: 'Manage Wi-Fi access', 6: 'Skip red clear; may leave ghosts'}
+        if getattr(self, '_library_menu', False):
+            if row == 2:
+                canvas.text('STARTER LIBRARY: ' + ('ON' if starter_library.enabled() else 'OFF'), 48, y + 8, 2, BLACK, 570)
+                canvas.text('Access the starter book collection', 48, y + 40, 1, BLACK, 570)
+            elif row == 3:
+                canvas.text('PAGE ON SCROLL: ' + ('ON' if book_library.library_auto_page_enabled() else 'OFF'), 48, y + 8, 2, BLACK, 570)
+                canvas.text('Move past settings to next page', 48, y + 40, 1, BLACK, 570)
+            return
+        if not led_menu and row in (2, 3, 4, 5):
+            main_labels = {2: 'LED SETTINGS...', 3: 'LIBRARY SETTINGS...', 4: 'WI-FI SETTINGS...', 5: 'QUICK BOOT: ' + ('ON' if self._quick_boot_enabled else 'OFF')}
+            main_descriptions = {2: 'Brightness and progress indicators', 3: 'Sort, group, and book libraries', 4: 'Manage Wi-Fi access', 5: 'Skip red clear; may leave ghosts'}
             canvas.text(main_labels[row], 48, y + 8, 2, BLACK, 570)
             canvas.text(main_descriptions[row], 48, y + 40, 1, BLACK, 570)
             return
-        if index == 0:
+        if not led_menu and row == 1:
             canvas.text("SIZE", 40, y + 8, 2, BLACK, 70)
             family = READER_FAMILIES[book_library.font_family()]
-            previews = (("Small", family['small'][0], 112, 24, 24, "small"),
-                        ("Medium", family['medium'][0], 180, 16, 31, "medium"),
-                        ("Large", family['large'][0], 300, 16, 46, "large"),
-                        ("XLarge", family['xl'][0], 420, 0, 65, "xl"))
-            for text, font, x, offset, underline, size in previews:
-                canvas.text(text, x, y + offset, 1, BLACK, 200, font)
+            previews = (("Small", family['small'][0], 132, "small"),
+                        ("Medium", family['medium'][0], 208, "medium"),
+                        ("Large", family['large'][0], 323, "large"),
+                        ("XLarge", family['xl'][0], 468, "xl"))
+            for text, font, x, size in previews:
+                offset = max(0, ((LIBRARY_FRAME_HEIGHT - font.line_height) // 16) * 8)
+                canvas.text(text, x, y + offset, 1, BLACK, 170, font)
                 if size == book_library.text_size():
-                    canvas.fill_rect(x, y + offset + underline + 2, font.measure(text), 2, BLACK)
-        elif index == 1:
+                    canvas.fill_rect(x, y + offset + font.line_height - 2, font.measure(text), 2, BLACK)
+        elif not led_menu and row == 0:
             canvas.text('FONT', 40, y + 8, 2, BLACK, 100)
             for text, family, x in (('OpenDyslexic', 'opendyslexic', 140), ('Ubuntu', 'ubuntu', 350), ('Tinos', 'tinos', 490)):
                 font = READER_FAMILIES[family]['medium'][0]
-                canvas.text(text, x, y + 32, 1, BLACK, 200, font)
+                offset = max(0, ((LIBRARY_FRAME_HEIGHT - font.line_height) // 16) * 8)
+                canvas.text(text, x, y + offset, 1, BLACK, 200, font)
                 if family == book_library.font_family():
-                    canvas.fill_rect(x, y + 32 + font.line_height, font.measure(text), 2, BLACK)
+                    canvas.fill_rect(x, y + offset + font.line_height - 2, font.measure(text), 2, BLACK)
         elif index == 4:
             canvas.text(label, 48, y + 8, 1, BLACK, 570)
             for text, mode, x in (("CHAPTER", "chapter", 48), ("BOOK", "book", 220), ("OFF", "off", 350)):
@@ -2512,12 +2746,49 @@ class PocketReaderApp(BaseApp):
         else:
             canvas.text(label, 48, y + 8, 1, BLACK, 570)
             canvas.text(descriptions[index], 48, y + 40, 1, BLACK, 570)
-        if self._settings_inline == 'size' and index == 0:
-            x, width = ((106, 70), (176, 120), (296, 120), (416, 216))[self._font_cursor]
+        if self._settings_inline == 'size' and not led_menu and row == 1:
+            x, width = ((124, 64), (200, 104), (315, 108), (460, 172))[self._font_cursor]
             canvas.rect(x, y, width, LIBRARY_FRAME_HEIGHT, 2, BLACK)
-        elif self._settings_inline == 'family' and index == 1:
+        elif self._settings_inline == 'family' and not led_menu and row == 0:
             x, width = ((136, 206), (346, 138), (486, 146))[self._family_cursor]
-            canvas.rect(x, y + 32, width, 48, 2, BLACK)
+            preview_family = ('opendyslexic', 'ubuntu', 'tinos')[self._family_cursor]
+            height = READER_FAMILIES[preview_family]['medium'][0].line_height
+            offset = max(0, ((LIBRARY_FRAME_HEIGHT - height) // 16) * 8)
+            canvas.rect(x, y + offset, width, min(height, LIBRARY_FRAME_HEIGHT), 2, BLACK)
+
+    def _draw_compact_lines(self, canvas, lines, family, size):
+        """Draw experimental compact lines after shared page layout."""
+        sizes = ('small', 'medium', 'large', 'xl')
+        base = sizes.index(size)
+        spacing = READER_FAMILIES[family][size][1]
+        for index, runs in enumerate(lines):
+            if not runs or (len(runs) == 1 and runs[0][1].get('_reserved')):
+                continue
+            def font_for(style):
+                heading = style.get('heading')
+                step = 2 if heading == 'h1' else 1 if heading == 'h2' else 0
+                return READER_FAMILIES[family][sizes[min(3, base + step)]][0]
+            def run_width(text, style):
+                font = font_for(style)
+                if not style.get('s'):
+                    return font.measure(text)
+                return sum(max(1, (font.measure(c.upper()) * 3 + 3) // 4) if 'a' <= c <= 'z' else font.measure(c) for c in text)
+            width = sum(run_width(text, style) for text, style in runs)
+            style = runs[0][1]
+            alignment = style.get('alignment')
+            if alignment == 'c':
+                x = max(32, (PORTRAIT_WIDTH - width) // 2)
+            elif alignment == 'r':
+                x = max(32, PORTRAIT_WIDTH - 32 - width)
+            else:
+                x = 48 if style.get('q') else 32
+            for text, style in runs:
+                font = font_for(style)
+                canvas.text(text, x, 80 + index * spacing, font=font,
+                            bold=bool(style.get('b')), italic=bool(style.get('i')), small_caps=bool(style.get('s')))
+                if style.get('u'):
+                    canvas.fill_rect(x, 80 + index * spacing + font.line_height - 1, run_width(text, style), 1)
+                x += run_width(text, style)
 
     def _draw_detail(self, canvas):
         if not self.reader:
@@ -2529,17 +2800,17 @@ class PocketReaderApp(BaseApp):
         self._draw_navigation_hints(canvas, reader=True)
         if any(self._page_for_word(word) == self.current_page for word in self._bookmarks):
             # Filled ribbon with a white V cut into the lower edge.
-            canvas.fill_rect(136, 5, 22, 37, BLACK)
+            canvas.fill_rect(208, 5, 22, 37, BLACK)
             for row in range(11):
-                canvas.fill_rect(146 - row, 31 + row, 2 + 2 * row, 1, WHITE)
-        canvas.text(title, max(184, 594 - HACK16.measure(title)), 8, 1, BLACK, 410)
+                canvas.fill_rect(218 - row, 31 + row, 2 + 2 * row, 1, WHITE)
+        canvas.text(title, max(240, 594 - HACK16.measure(title)), 8, 1, BLACK, 354)
         chapter_title = ''
         for position, name in self._chapters:
             if int(position) > int(self.current_word):
                 break
             chapter_title = str(name)
         if chapter_title:
-            canvas.text(chapter_title, max(184, 594 - HACK16.measure(chapter_title)), 40, 1, BLACK, 410)
+            canvas.text(chapter_title, max(240, 594 - HACK16.measure(chapter_title)), 40, 1, BLACK, 354)
         self._draw_battery(canvas)
         canvas.fill_rect(32, 72, PORTRAIT_WIDTH - 64, 3, RED)
         size = self.reader.size or book_library.text_size()
@@ -2549,22 +2820,27 @@ class PocketReaderApp(BaseApp):
                 size = "xl"
         family = self.reader.font_family if self.reader.header.get('schema') != 1 else 'opendyslexic'
         reader_font, line_spacing, line_count = READER_FAMILIES[family][size]
-        for index, line in enumerate(lines[:line_count]):
-            display_font = reader_font
-            center = False
-            if self.reader.header.get('schema') == 4 and line[:2] in ('\x1fC', '\x1fH', '\x1fL'):
-                marker, line = line[:2], line[2:]
-                center = marker in ('\x1fC', '\x1fH')
-                if marker in ('\x1fH', '\x1fL'):
-                    larger = {'small':'medium', 'medium':'large', 'large':'xl', 'xl':'xl'}[size]
-                    display_font = READER_FAMILIES[family][larger][0]
-            x = max(32, (PORTRAIT_WIDTH - display_font.measure(line)) // 2) if center else 32
-            canvas.text(line, x, 80 + index * line_spacing, 2, BLACK,
-                        PORTRAIT_WIDTH - 64, display_font)
+        if self.reader.header.get('schema') == 5:
+            self._draw_compact_lines(canvas, lines[:line_count], family, size)
+        else:
+            for index, line in enumerate(lines[:line_count]):
+                display_font = reader_font
+                center = False
+                if self.reader.header.get('schema') == 4 and line[:2] in ('\x1fC', '\x1fH', '\x1fL'):
+                    marker, line = line[:2], line[2:]
+                    center = marker in ('\x1fC', '\x1fH')
+                    if marker in ('\x1fH', '\x1fL'):
+                        larger = {'small':'medium', 'medium':'large', 'large':'xl', 'xl':'xl'}[size]
+                        display_font = READER_FAMILIES[family][larger][0]
+                x = max(32, (PORTRAIT_WIDTH - display_font.measure(line)) // 2) if center else 32
+                canvas.text(line, x, 80 + index * line_spacing, 2, BLACK,
+                            PORTRAIT_WIDTH - 64, display_font)
         self._draw_bottom_hints(canvas, reader=True)
-        canvas.text("{} / {}".format(self.current_page + 1, len(self.reader.pages)), 520, 928, 1, BLACK, 120)
+        page_label = "{} / {}".format(self.current_page + 1, len(self.reader.pages))
+        page_x = max(400, PORTRAIT_WIDTH - 32 - HACK24.measure(page_label))
+        canvas.text(page_label, page_x, 928, 2, BLACK, PORTRAIT_WIDTH - 32 - page_x)
         if self.update_status:
-            canvas.text(self.update_status, 170, 888, 1, BLACK, 440)
+            canvas.text(self.update_status, 208, 888, 2, BLACK, 420)
 
     def _draw_bookmarks(self, canvas):
         self._draw_navigation_hints(canvas)
@@ -2604,8 +2880,8 @@ class PocketReaderApp(BaseApp):
 
     def _draw_wifi_menu(self, canvas):
         self._draw_navigation_hints(canvas)
-        title = "WIFI: " + self._wifi_chosen if self._wifi_view == "duration" else "WI-FI & INTERNET SETTINGS"
-        canvas.text(title, 180, 24, 2, BLACK, 405)
+        title = "WIFI: " + self._wifi_chosen if self._wifi_view == "duration" else "WI-FI SETTINGS"
+        canvas.text(title, 240, 24, 2, BLACK, 345)
         self._draw_battery(canvas)
         canvas.fill_rect(32, 72, PORTRAIT_WIDTH - 64, 3, BLACK)
         if self._wifi_view == "login":
@@ -2624,15 +2900,20 @@ class PocketReaderApp(BaseApp):
             canvas.text("MENU+ TO RETURN", 32, 520, 1, BLACK, 590)
             self._draw_bottom_hints(canvas)
             return
+        network_items = []
+        address = ''
+        connected_name = ''
         if self._wifi_view == "duration":
             items = list(WIFI_DURATION_ITEMS)
             if wifi_setup.radio_status()[0]:
                 items.append("TURN WIFI OFF")
         else:
             connected = wifi_setup.radio_status()[1]
-            preferred = wifi_setup.preferred_ssid()
+            connected_name = wifi_setup.connected_ssid() if connected else ''
+            address, _ = wifi_setup.network_portal_status()
+            network_items = self._wifi_main_items()
             items = []
-            for item in self._wifi_main_items():
+            for item in network_items:
                 if item is None:
                     items.append(None)
                 elif item[0] == 'hotspot':
@@ -2643,7 +2924,7 @@ class PocketReaderApp(BaseApp):
                     items.append('WEB LOGIN INFO')
                 else:
                     name = item[1].get('ssid', '')
-                    items.append(name + (' (ON)' if connected and name == preferred else ''))
+                    items.append(name + (' (ON)' if connected and name == connected_name else ''))
         if not items:
             canvas.text("NO SAVED NETWORKS", 32, 120, 2, BLACK, 500)
             canvas.text("ADD ONE USING THE HOTSPOT", 32, 168, 1, BLACK, 550)
@@ -2655,16 +2936,17 @@ class PocketReaderApp(BaseApp):
                 index = start + row
                 y = 96 + row * 96
                 canvas.rect(32, y, PORTRAIT_WIDTH - 64, 84, 3 if index == self._wifi_cursor else 1, BLACK)
-                if self._wifi_view == 'main' and index == 7:
-                    canvas.text(label, 54, y + 8, 2, BLACK, 550)
-                    address, _ = wifi_setup.network_portal_status()
-                    canvas.text('IP: ' + address if address else 'NOT CONNECTED', 54, y + 48, 1, BLACK, 550)
+                is_connected_network = (self._wifi_view == 'main' and address and connected_name
+                                        and network_items[index][0] == 'network'
+                                        and network_items[index][1].get('ssid', '') == connected_name)
+                if is_connected_network:
+                    canvas.text(label, 54, y + 24, 2, BLACK, 320)
+                    canvas.text('IP: ' + address, 392, y + 24, 2, BLACK, PORTRAIT_WIDTH - 424)
                 else:
                     canvas.text(label, 54, y + 24, 2, BLACK, 550)
         if self._wifi_view == "main":
             address, web_error = wifi_setup.network_portal_status()
             if address and len(items) <= 7:
-                canvas.text("IP: " + address, 48, 824, 1, BLACK, 590)
                 hostname = wifi_setup.local_hostname()
                 if hostname:
                     canvas.text("http://" + hostname + ".local", 48, 848, 1, BLACK, 590)
@@ -2687,7 +2969,7 @@ class PocketReaderApp(BaseApp):
             canvas.wrapped_text(self.update_status, 64, 336, PORTRAIT_WIDTH - 128,
                                 1, BLACK, line_gap=0)
         elif self.update_status:
-            canvas.text(self.update_status, 170, 888, 1, BLACK, 440)
+            canvas.text(self.update_status, 208, 888, 2, BLACK, 420)
         self._draw_bottom_hints(canvas)
 
     def _draw_setup(self, canvas):

@@ -32,14 +32,26 @@ Here is the story.
 The reader wraps records to the selected font and size. Larger lines reserve
 extra vertical space when needed; a heading is moved to the next page if it
 would otherwise be split at the bottom. The largest text size stays at the
-largest font. Explicit breaks start a new page. The converter retains basic
-centering, larger block text, and page breaks; it does not yet preserve every
-EPUB style, including inline bold and italic.
+largest font. Explicit breaks start a new page. Schema 4 retains basic
+centering, larger block text, and page breaks; it does not preserve inline
+bold and italic.
+
+Schema 5 adds compact markup for headings, alignment, bold, italics, underlines,
+small caps, block quotes, paragraphs, line breaks, page breaks, dividers,
+tables, and footnotes. For example, `<s>Small Caps</s>` displays lowercase
+letters as smaller capitals while retaining the stored letter case;
+`<u>underlined</u>` is underlined. Styles can be combined and are included in
+page layout and indexes. A literal `<` is encoded as `<<`.
+
+When footnotes are present, the header records `body_length` and `notes_length`;
+the note text follows the body as a UTF-8 JSON object. The current reader caps
+the combined note data at 256 KiB. See `MARKUP_DESIGN.md` for the markup rules.
 
 A matching `.pri` sidecar is JSON with `version: 1`, `book_id`, the SHA-256
 of the complete `.prb`, `chapters`, and `sizes`. A chapter is a pair of
 zero-based word position and title. Size indexes use `layout_version: 2` for
-schema 4 and store delta-varint, base64-encoded triples of body-byte offset,
+schema 4 and `layout_version: 4` for schema 5, and store delta-varint,
+base64-encoded triples of body-byte offset,
 wrapped-line index, and word position. The font metrics hashes and line count
 identify the layout. The reader can rebuild missing or incompatible size
 indexes; chapter information remains independent of font size. Schema 3 may

@@ -17,6 +17,50 @@ def load_methods(names, scope):
 
 
 class FastMenus(unittest.TestCase):
+    def test_font_and_size_previews_are_centered_and_spaced(self):
+        class Font:
+            def __init__(self, height): self.line_height = height
+            def measure(self, text): return len(text) * 8
+        families = {family: {size: (Font(height), 0, 0) for size, height in zip(('small','medium','large','xl'), heights)}
+                    for family, heights in {'opendyslexic': (32,48,56,80), 'ubuntu': (24,32,40,56), 'tinos': (24,32,40,56)}.items()}
+        library = types.SimpleNamespace(font_family=lambda:'opendyslexic', text_size=lambda:'medium')
+        scope = {'book_library': library, 'READER_FAMILIES': families, 'LIBRARY_ROW_Y':96,
+                 'LIBRARY_ROW_HEIGHT':96, 'LIBRARY_FRAME_HEIGHT':84, 'PORTRAIT_WIDTH':672,
+                 'BLACK':1, 'HACK16':Font(16)}
+        App = load_methods(('_draw_settings_row',), scope)
+        app = App();app._led_menu=app._library_menu=False;app._settings_cursor=0
+        app._idle_light_minutes=0;app._light_brightness='medium';app._availability_lights=False
+        app._quick_boot_enabled=False;app._settings_inline=None
+        calls=[]
+        canvas=types.SimpleNamespace(rect=lambda *args:None, fill_rect=lambda *args:None,
+                                     text=lambda *args:calls.append(args))
+        app._draw_settings_row(canvas,0)
+        for label in ('OpenDyslexic','Ubuntu','Tinos'):
+            call=next(item for item in calls if item[0]==label);font=call[-1]
+            self.assertLessEqual(abs(84-2*(call[2]-96)-font.line_height), 15)
+        calls.clear();app._draw_settings_row(canvas,1)
+        choices=[next(item for item in calls if item[0]==label) for label in ('Small','Medium','Large','XLarge')]
+        self.assertGreater(choices[0][1],110)
+        for call in choices:
+            font=call[-1];self.assertLessEqual(abs(84-2*(call[2]-192)-font.line_height), 15)
+
+    def test_bookmark_refresh_is_partial_only_on_the_same_book_page(self):
+        queued = []
+        display = types.SimpleNamespace(black=None, red=None, clear=lambda: None)
+        scope = {'display': display, 'PortraitCanvas': lambda *_: object()}
+        App = load_methods(('_draw',), scope)
+        app = App(); app.reader_display = types.SimpleNamespace(queue_frame=lambda **kw: queued.append(kw))
+        app._screen_identity = lambda: ('book',); app._drawn_screen = ('book',)
+        app._read_battery = app._draw_detail = app._draw_wifi_indicator = lambda *args: None
+        app._menu_snapshot = lambda: None
+        app._show_reading_progress = lambda: None
+        app._wifi_menu = app._settings_menu = app._toc_menu = app._bookmark_menu = False
+        app.detail = True; app.reader = types.SimpleNamespace(entry={'id': 'one'}); app.current_page = 2
+        app._small_update = True; app._bookmark_partial = ('one', 2)
+        app._draw(); self.assertEqual(queued[-1], {'partial': True})
+        app._small_update = True; app._bookmark_partial = ('one', 2); app.current_page = 3
+        app._draw(); self.assertEqual(queued[-1], {'partial': False})
+
     def test_settings_wifi_chapters_bookmarks_share_fast_path(self):
         rectangles = []; queued = []; ready = [True]
         class Canvas:
@@ -71,4 +115,4 @@ class FastMenus(unittest.TestCase):
         self.assertEqual(leds[6], (0,0,2)); self.assertEqual(leds[0], (0,0,2))
         app._suppress_chord = False; app.update_status = ''; app._show_settings_led = lambda: None
         back.state = True; app._run_wifi_menu()
-        self.assertFalse(app._wifi_menu); self.assertTrue(app._settings_menu); self.assertEqual(app._settings_cursor, 5)
+        self.assertFalse(app._wifi_menu); self.assertTrue(app._settings_menu); self.assertEqual(app._settings_cursor, 4)

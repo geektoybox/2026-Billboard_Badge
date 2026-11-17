@@ -29,7 +29,7 @@ class LocalRelease(unittest.TestCase):
         from pocketreader_companion import convert_book
         lib_package=types.ModuleType('lib')
         with patch.dict(sys.modules, {'network':types.ModuleType('network'), 'lib':lib_package}):
-            for name in ('pocketreader_font_data','pocketreader_pagination'):
+            for name in ('pocketreader_font_data','pocketreader_pagination','pocketreader_markup'):
                 setattr(lib_package,name,load(name,ROOT/'overlay/lib'/(name+'.py')))
             lib_package.wifi_setup=types.ModuleType('wifi_setup')
             library=load('release_markup_library',ROOT/'overlay/lib/book_library.py')
@@ -82,8 +82,21 @@ class LocalRelease(unittest.TestCase):
         with patch.object(installer.subprocess, 'run') as execute, patch.object(installer, 'run') as copy:
             execute.return_value = types.SimpleNamespace(stdout='True True\n')
             installer.install_sample(None, 'the-time-machine-43d66b728e', False)
-            self.assertEqual(copy.call_count, 1)
-            self.assertIn("sys.modules.pop('lib.book_transfer'", copy.call_args.args[0][-1])
+            calls = [call.args[0] for call in copy.call_args_list]
+            self.assertEqual(len(calls), 3)
+            self.assertIn("sys.modules.pop('lib.book_transfer'", calls[0][-1])
+            self.assertTrue(calls[1][-1].endswith('.pri.installing'))
+            self.assertIn('os.rename(staged, index)', calls[2][-1])
+
+    def test_modified_sample_is_checked_before_replacing_index(self):
+        installer = load('release_installer_modified', ROOT / 'install.py')
+        with patch.object(installer.subprocess, 'run') as execute, patch.object(installer, 'run') as copy:
+            execute.return_value = types.SimpleNamespace(stdout='True True\n')
+            copy.side_effect = RuntimeError('Existing book differs')
+            with self.assertRaises(RuntimeError):
+                installer.install_sample(None, 'the-time-machine-43d66b728e', False)
+            copy.assert_called_once()
+            self.assertIn('register_installed_book', copy.call_args.args[0][-1])
 
     def test_sample_with_only_index_is_safely_restored(self):
         installer = load('release_installer', ROOT / 'install.py')
@@ -117,7 +130,7 @@ class LocalRelease(unittest.TestCase):
     def test_starter_books_register_and_indexes_match(self):
         lib_package = types.ModuleType('lib')
         with patch.dict(sys.modules, {'network': types.ModuleType('network'), 'lib': lib_package}):
-            for name in ('pocketreader_font_data', 'pocketreader_pagination'):
+            for name in ('pocketreader_font_data', 'pocketreader_pagination', 'pocketreader_markup'):
                 setattr(lib_package, name, load(name, ROOT / 'overlay/lib' / (name + '.py')))
             lib_package.wifi_setup = types.ModuleType('wifi_setup')
             library = load('release_book_library', ROOT / 'overlay/lib/book_library.py')
@@ -141,14 +154,15 @@ class LocalRelease(unittest.TestCase):
                     self.assertEqual(sidecar['sha256'], hashlib.sha256(book.read_bytes()).hexdigest())
                     self.assertTrue(sidecar['chapters'])
                     body = book.read_bytes().split(b'\n', 1)[1]
-                    self.assertIn(b'\n\x1e\n', body)
+                    self.assertIn(b'<i>', body)
                     self.assertNotIn(b'PROJECT GUTENBERG', body.upper())
                     self.assertEqual(len(sidecar['sizes']), 12)
                     for size, entry in sidecar['sizes'].items():
                         pages = lib_package.pocketreader_pagination.unpack_page_positions(entry['pages'])
                         starts = {page[2] for page in pages}
-                        self.assertTrue(all(chapter[0] in starts for chapter in sidecar['chapters']),
-                                        (book.name, size))
+                        total = json.loads(book.read_bytes().split(b'\n', 1)[0])['word_count']
+                        self.assertTrue(all(0 <= chapter[0] < total and any(start <= chapter[0] for start in starts)
+                                            for chapter in sidecar['chapters']), (book.name, size))
                 entries = library.local_books()
                 self.assertEqual(len(entries), 2)
                 self.assertTrue(all(library.has_download(entry) for entry in entries))

@@ -80,7 +80,7 @@ def reader_only_mode(port: str | None) -> bool:
 
 
 def install_sample(port: str | None, name: str, dry_run: bool) -> None:
-    """Recover interrupted installs without overwriting any existing files."""
+    """Preserve existing books and safely refresh their matching indexes."""
     files = (name + '.prb', name + '.pri')
     expected = hashlib.sha256((ROOT / 'books' / files[0]).read_bytes()).hexdigest()
     if dry_run:
@@ -94,9 +94,14 @@ def install_sample(port: str | None, name: str, dry_run: bool) -> None:
         if not answer or answer[0] not in ('True True', 'True False', 'False True', 'False False'):
             raise RuntimeError('Could not check existing sample files')
         present = tuple(value == 'True' for value in answer[0].split())
-    if present == (False, True):
-        # Deleting a book can leave its rebuildable index behind. Stage the new
-        # index before replacing the orphan; reading preferences are separate.
+    register = command(port, 'exec',
+        "import sys; sys.modules.pop('lib.book_transfer', None); "
+        "import lib.book_transfer as transfer; transfer.register_installed_book({!r}, {!r})".format(name, expected))
+    # Validate an existing book before replacing its rebuildable index.
+    if present[0]:
+        run(register, dry_run)
+    if present[1]:
+        # Stage the index before replacing the previous copy; progress is separate.
         index_path = '/books/' + files[1]
         staged = index_path + '.installing'
         backup = index_path + '.replaced'
@@ -122,10 +127,8 @@ os.remove(backup)
         run(command(port, 'exec', replace), dry_run)
     if not present[0]:
         run(command(port, 'cp', str(ROOT / 'books' / files[0]), ':/books/' + files[0]), dry_run)
-    # A running reader can retain the old module after its file is replaced.
-    run(command(port, 'exec',
-        "import sys; sys.modules.pop('lib.book_transfer', None); "
-        "import lib.book_transfer as transfer; transfer.register_installed_book({!r}, {!r})".format(name, expected)), dry_run)
+    if not present[0]:
+        run(register, dry_run)
     if not present[1]:
         run(command(port, 'cp', str(ROOT / 'books' / files[1]), ':/books/' + files[1]), dry_run)
 
@@ -155,6 +158,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", help="Serial device, for example /dev/ttyACM0 or COM5")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without changing the badge")
+    parser.add_argument("--skip-samples", action="store_true", help="Install the reader without changing sample books")
     args = parser.parse_args()
 
     if shutil.which("mpremote") is None and not args.dry_run:
@@ -195,6 +199,7 @@ def main() -> int:
     run(command(args.port, "cp", str(OVERLAY / "lib" / "book_library.py"), ":/lib/book_library.py"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "book_transfer.py"), ":/lib/book_transfer.py"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "pocketreader_pagination.py"), ":/lib/pocketreader_pagination.py"), args.dry_run)
+    run(command(args.port, "cp", str(OVERLAY / "lib" / "pocketreader_markup.py"), ":/lib/pocketreader_markup.py"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "starter_library.py"), ":/lib/starter_library.py"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "pocketreader_sleep.py"), ":/lib/pocketreader_sleep.py"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "sleep_image.py"), ":/lib/sleep_image.py"), args.dry_run)
@@ -207,8 +212,11 @@ def main() -> int:
     run(command(args.port, "cp", str(TINOS_LICENSE), ":/data/pocketreader-tinos-license.txt"), args.dry_run)
     run(command(args.port, "cp", str(OVERLAY / "lib" / "app_switcher.py"), ":/lib/app_switcher.py"), args.dry_run)
     run(command(args.port, 'exec', "import os; os.mkdir('/books') if 'books' not in os.listdir('/') else None"), args.dry_run)
-    for name in ('the-time-machine-43d66b728e', 'the-war-of-the-worlds-c3be57880e'):
-        install_sample(args.port, name, args.dry_run)
+    if not args.skip_samples:
+        for name in ('the-time-machine-43d66b728e', 'the-war-of-the-worlds-c3be57880e'):
+            install_sample(args.port, name, args.dry_run)
+    # Remove the obsolete, rebuildable library progress summary if present.
+    run(command(args.port, "exec", "import os; os.remove('/data/pocketreader_library_progress.json') if 'pocketreader_library_progress.json' in os.listdir('/data') else None"), args.dry_run)
     run(command(args.port, "reset"), args.dry_run)
     if args.dry_run:
         print("Dry run complete; the badge was not changed.")

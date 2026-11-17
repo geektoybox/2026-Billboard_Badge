@@ -220,6 +220,20 @@ def radio_status():
     return (bool(station.active() or ap.active()), bool(station.isconnected()))
 
 
+def connected_ssid():
+    """Return the network actually connected, rather than a saved preference."""
+    station = network.WLAN(network.WLAN.IF_STA)
+    if not station.isconnected():
+        return ""
+    try:
+        name = station.config("ssid")
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        return name if isinstance(name, str) else ""
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+
+
 async def connect_saved(ssid, duration_ms, on_radio=None, remember=True):
     global _mode, _deadline, _generation, _automatic_connection
     chosen = None
