@@ -31,6 +31,8 @@ class RefreshWifi(unittest.IsolatedAsyncioTestCase):
         exec(compile(code,str(SOURCE),'exec'),scope);app=scope['App']()
         app._wifi_task=None;app._catalog_task=object();app.reader_display=types.SimpleNamespace(ready=lambda:True)
         app._draw=lambda:events.append(('display',app.update_status))
+        async def clear_window(): events.append('clear window')
+        app._clear_refresh_window=clear_window
         app._update_wifi_indicator=lambda:None;app._load_cached_catalog=lambda:events.append('load')
         app.detail=app._settings_menu=app._wifi_menu=False
         app._select_first_on_library_page=lambda:None;app._show_selection_led=lambda:None
@@ -39,7 +41,7 @@ class RefreshWifi(unittest.IsolatedAsyncioTestCase):
 
     async def test_offline_refresh_connects_and_turns_off(self):
         events,app=await self.run_case(False)
-        self.assertEqual(events,['begin',('display','REFRESHING LIBRARY'),('display','CONNECTING last network'),('connect','last network',False),'refresh','load',('off',False),'end'])
+        self.assertEqual(events,['begin','clear window',('display','REFRESHING LIBRARY'),('display','CONNECTING last network'),('connect','last network',False),'refresh','load',('off',False),'end'])
         self.assertEqual(app.update_status,'LIBRARY UPDATED')
 
     async def test_already_connected_remains_on(self):

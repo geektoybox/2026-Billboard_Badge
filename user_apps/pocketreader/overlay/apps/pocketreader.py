@@ -554,6 +554,8 @@ class PocketReaderApp(BaseApp):
             if self._dirty and self.reader_display.ready():
                 self._draw()
             return
+        if getattr(self, '_refresh_preclear', False):
+            return
         if self._catalog_task is not None or self._wifi_task is not None:
             self._device_idle_since = time.ticks_ms()
 
@@ -1445,10 +1447,28 @@ class PocketReaderApp(BaseApp):
             index = (index + 1) % len(ROW_LED_MAP)
             await aio.sleep_ms(150)
 
+    async def _clear_refresh_window(self):
+        # Force the window's white pixels through the partial waveform twice;
+        # identical frames would otherwise be skipped by the panel driver.
+        self._refresh_preclear = True
+        try:
+            while not self.reader_display.ready():
+                await aio.sleep_ms(25)
+            canvas = PortraitCanvas(display.black, display.red)
+            canvas.fill_rect(75, 350, 530, 160, WHITE)
+            region = PortraitCanvas._physical_rect(75, 350, 530, 160)
+            for _ in range(2):
+                self.reader_display.queue_frame(partial=True, force_white_region=region)
+                while not self.reader_display.ready():
+                    await aio.sleep_ms(25)
+        finally:
+            self._refresh_preclear = False
+
     async def _refresh_catalog(self):
         wifi_setup.begin_operation()
         temporary_connection = False
         try:
+            await self._clear_refresh_window()
             await self._show_download_status('REFRESHING LIBRARY')
             if starter_library.enabled():
                 temporary_connection = await self._connect_starter_wifi()

@@ -1,5 +1,5 @@
 """Public starter library stays opt-in and verifies downloads."""
-import asyncio, hashlib, importlib.util, io, json, sys, tempfile, types, unittest
+import asyncio, hashlib, importlib.util, io, json, os, sys, tempfile, types, unittest
 from pathlib import Path
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
@@ -83,6 +83,98 @@ class StarterLibraryTest(unittest.TestCase):
             self.assertEqual(registered,[(item['id'],sha)])
             self.assertEqual(progress[-1],(len(index)+len(payload),len(index)+len(payload)))
             app.set_enabled(False);self.assertEqual(app.load_catalog(),[]);self.assertEqual(Path(path).read_bytes(),payload)
+
+    def test_matching_orphan_index_is_kept_and_not_redownloaded(self):
+        payload=b'book'; digest=hashlib.sha256(payload).hexdigest()
+        index=json.dumps({'version':1,'book_id':'pg1','sha256':digest,'sizes':{},'chapters':[]}).encode()
+        item={'id':'pg1','title':'Test','author':'Author','size':len(payload),'sha256':digest,
+              'index_size':len(index),'index_sha256':hashlib.sha256(index).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            folder=Path(reader.BOOK_DIR);folder.mkdir();existing=folder/'pg1.pri';existing.write_bytes(index)
+            inode=existing.stat().st_ino; progress=[]
+            files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload})
+            app.set_enabled(True)
+            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):
+                result=asyncio.run(app.download(item,progress=lambda received,total:progress.append((received,total))))
+            self.assertEqual(Path(result).read_bytes(),payload)
+            self.assertEqual(existing.read_bytes(),index)
+            self.assertEqual(existing.stat().st_ino,inode)
+            self.assertEqual(progress[-1],(len(payload),len(payload)))
+            self.assertEqual(registered,[('pg1',digest)])
+
+    def test_mismatched_orphan_index_is_replaced_after_verification(self):
+        payload=b'book'; digest=hashlib.sha256(payload).hexdigest()
+        index=json.dumps({'version':1,'book_id':'pg1','sha256':digest,'sizes':{},'chapters':[]}).encode()
+        item={'id':'pg1','title':'Test','author':'Author','size':len(payload),'sha256':digest,
+              'index_size':len(index),'index_sha256':hashlib.sha256(index).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            folder=Path(reader.BOOK_DIR);folder.mkdir();existing=folder/'pg1.pri';existing.write_bytes(b'old index')
+            progress_file=folder/'pg1.prp';progress_file.write_bytes(b'reading progress')
+            files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload,'pg1.pri':index})
+            app.set_enabled(True)
+            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):asyncio.run(app.download(item))
+            self.assertEqual(existing.read_bytes(),index)
+            self.assertEqual((folder/'pg1.prb').read_bytes(),payload)
+            self.assertEqual(progress_file.read_bytes(),b'reading progress')
+            self.assertFalse((folder/'pg1.pri.download-backup').exists())
+
+    def test_failed_replacement_keeps_orphan_index(self):
+        payload=b'book'; digest=hashlib.sha256(payload).hexdigest()
+        index=json.dumps({'version':1,'book_id':'pg1','sha256':digest,'sizes':{},'chapters':[]}).encode()
+        item={'id':'pg1','title':'Test','author':'Author','size':len(payload),'sha256':digest,
+              'index_size':len(index),'index_sha256':hashlib.sha256(index).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            folder=Path(reader.BOOK_DIR);folder.mkdir();existing=folder/'pg1.pri';existing.write_bytes(b'old index')
+            files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload,'pg1.pri':b'x'*len(index)})
+            app.set_enabled(True)
+            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):
+                with self.assertRaises(reader.LibraryError):asyncio.run(app.download(item))
+            self.assertEqual(existing.read_bytes(),b'old index')
+            self.assertFalse((folder/'pg1.prb').exists())
+            self.assertEqual(registered,[])
+
+    def test_existing_index_changed_during_download_is_not_overwritten(self):
+        payload=b'book'; digest=hashlib.sha256(payload).hexdigest()
+        index=json.dumps({'version':1,'book_id':'pg1','sha256':digest,'sizes':{},'chapters':[]}).encode()
+        item={'id':'pg1','title':'Test','author':'Author','size':len(payload),'sha256':digest,
+              'index_size':len(index),'index_sha256':hashlib.sha256(index).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            folder=Path(reader.BOOK_DIR);folder.mkdir();existing=folder/'pg1.pri';existing.write_bytes(index)
+            files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload})
+            app.set_enabled(True);fetch=app._fetch_starter_file
+            async def concurrent_change(name, *args):
+                await fetch(name, *args)
+                if name.endswith('.prb'): existing.write_bytes(b'changed elsewhere')
+            app._fetch_starter_file=concurrent_change
+            with patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):
+                with self.assertRaisesRegex(reader.LibraryError,'Index changed'):asyncio.run(app.download(item))
+            self.assertEqual(existing.read_bytes(),b'changed elsewhere')
+            self.assertFalse((folder/'pg1.prb').exists())
+
+    def test_replacing_orphan_restores_it_if_book_install_fails(self):
+        payload=b'book'; digest=hashlib.sha256(payload).hexdigest()
+        index=json.dumps({'version':1,'book_id':'pg1','sha256':digest,'sizes':{},'chapters':[]}).encode()
+        item={'id':'pg1','title':'Test','author':'Author','size':len(payload),'sha256':digest,
+              'index_size':len(index),'index_sha256':hashlib.sha256(index).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp:
+            app,reader,transfer,files,registered,lib=self.setup_modules(temp)
+            folder=Path(reader.BOOK_DIR);folder.mkdir();existing=folder/'pg1.pri';existing.write_bytes(b'old index')
+            files.update({'device.json':json.dumps({'schema':1,'books':[item]}).encode(),'pg1.prb':payload,'pg1.pri':index})
+            app.set_enabled(True)
+            def fail_book_rename(src,dst):
+                if src.endswith('.prb.tmp'): raise OSError('no space')
+                return os.rename(src,dst)
+            fake_os=types.SimpleNamespace(mkdir=os.mkdir,remove=os.remove,rename=fail_book_rename)
+            with patch.object(app,'os',fake_os), patch.dict(sys.modules,{'lib':lib,'lib.book_transfer':transfer}):
+                with self.assertRaises(OSError):asyncio.run(app.download(item))
+            self.assertEqual(existing.read_bytes(),b'old index')
+            self.assertFalse((folder/'pg1.prb').exists())
+            self.assertFalse((folder/'pg1.pri.download-backup').exists())
+            self.assertEqual(registered,[])
 
     def test_transfer_yields_so_light_animation_can_advance(self):
         payload=b'x'*8192

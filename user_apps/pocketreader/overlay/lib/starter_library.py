@@ -219,6 +219,17 @@ async def _fetch_starter_file(name, temporary, expected_size, expected_hash,
     raise book_library.LibraryError('Starter download failed: ' + _error_detail(error))
 
 
+def _file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        while True:
+            chunk = source.read(4096)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
+
+
 async def download(entry, progress=None):
     if not enabled():
         raise book_library.LibraryError('Starter library is off')
@@ -229,8 +240,10 @@ async def download(entry, progress=None):
     index = book_library.BOOK_DIR + '/' + book_id + '.pri'
     if book_library._exists(path):
         raise book_library.LibraryError('Book already exists; refresh library')
-    if book_library._exists(index):
-        raise book_library.LibraryError('An index already exists for this book')
+    backup = index + '.download-backup'
+    if book_library._exists(backup):
+        raise book_library.LibraryError('Index recovery is needed before downloading this book')
+    original_index = _file_digest(index) if book_library._exists(index) else None
 
     # Resolve the selected title against the live catalog before considering
     # eviction: cached index sizes can change after a library update.
@@ -242,8 +255,12 @@ async def download(entry, progress=None):
             break
     if entry is None:
         raise book_library.LibraryError('Book is no longer in the library')
-    # Verify both URLs and advertised sizes before removing any existing copy.
-    for suffix, size in (('.pri', entry['index_size']), ('.prb', entry['size'])):
+    reuse_index = (original_index is not None and
+                   binascii.hexlify(original_index).decode() == entry['index_sha256'])
+    # Verify download URLs and advertised sizes before removing any existing copy.
+    downloads = ((('.prb', entry['size']),) if reuse_index else
+                 (('.pri', entry['index_size']), ('.prb', entry['size'])))
+    for suffix, size in downloads:
         _, writer = await _open_download(BASE + book_id + suffix, size)
         writer.close()
         try:
@@ -256,15 +273,18 @@ async def download(entry, progress=None):
     except OSError:
         pass
     recoverable = {item['id']: item['sha256'] for item in catalog['books']}
-    book_library.ensure_space(entry['size'] + entry['index_size'] + MAX_CATALOG + 32768,
+    required = entry['size'] + (0 if reuse_index else entry['index_size'])
+    book_library.ensure_space(required + MAX_CATALOG + 32768,
                               book_id, recoverable=recoverable)
     book_library._write_json(CATALOG_PATH, catalog)
     book_tmp, index_tmp = path + '.tmp', index + '.tmp'
-    total_size = entry['index_size'] + entry['size']
+    index_download_size = 0 if reuse_index else entry['index_size']
+    total_size = index_download_size + entry['size']
     try:
-        await _fetch_starter_file(book_id + '.pri', index_tmp, entry['index_size'],
-                                  entry['index_sha256'], progress, 0, total_size)
-        with open(index_tmp, 'r') as file:
+        if not reuse_index:
+            await _fetch_starter_file(book_id + '.pri', index_tmp, entry['index_size'],
+                                      entry['index_sha256'], progress, 0, total_size)
+        with open(index if reuse_index else index_tmp, 'r') as file:
             sidecar = json.load(file)
         version = sidecar.get('version') if isinstance(sidecar, dict) else None
         if type(version) is int and version > 1:
@@ -272,16 +292,37 @@ async def download(entry, progress=None):
         if not isinstance(sidecar, dict) or version != 1 or sidecar.get('book_id') != book_id or sidecar.get('sha256') != entry['sha256']:
             raise book_library.LibraryError('Invalid starter index')
         await _fetch_starter_file(book_id + '.prb', book_tmp, entry['size'],
-                                  entry['sha256'], progress, entry['index_size'], total_size)
-        if book_library._exists(path) or book_library._exists(index):
+                                  entry['sha256'], progress, index_download_size, total_size)
+        if book_library._exists(path):
             raise book_library.LibraryError('Book appeared during download')
-        os.rename(book_tmp, path)
-        try:
-            os.rename(index_tmp, index)
-            book_transfer.register_installed_book(book_id, entry['sha256'])
-        except Exception:
-            # Preserve already written files if registration fails; they can be recovered.
-            raise
+        if book_library._exists(index):
+            if original_index is None or _file_digest(index) != original_index:
+                raise book_library.LibraryError('Index changed during download')
+            if not reuse_index:
+                os.rename(index, backup)
+        elif original_index is not None:
+            raise book_library.LibraryError('Index changed during download')
+        if reuse_index:
+            os.rename(book_tmp, path)
+        else:
+            try:
+                os.rename(index_tmp, index)
+                try:
+                    os.rename(book_tmp, path)
+                except Exception:
+                    os.remove(index)
+                    raise
+            except Exception:
+                if original_index is not None and book_library._exists(backup) and not book_library._exists(index):
+                    os.rename(backup, index)
+                raise
+        # Keep the verified pair if registration fails so it can be recovered.
+        book_transfer.register_installed_book(book_id, entry['sha256'])
+        if original_index is not None and not reuse_index:
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
         return path
     finally:
         for temporary in (book_tmp, index_tmp):

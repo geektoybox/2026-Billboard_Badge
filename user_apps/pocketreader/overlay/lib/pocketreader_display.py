@@ -6,6 +6,23 @@ import sys
 from lib.epd import display
 
 
+def _force_white_region(buf, shown, rect):
+    """Force one black-to-white drive in a white physical-framebuffer area."""
+    x, y, width, height = rect
+    if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 960 or y + height > 672:
+        raise ValueError('Invalid white refresh area')
+    first, last = x // 8, (x + width - 1) // 8
+    for row in range(y, y + height):
+        for column in range(first, last + 1):
+            lo = x % 8 if column == first else 0
+            hi = (x + width - 1) % 8 if column == last else 7
+            mask = ((1 << (hi - lo + 1)) - 1) << lo
+            offset = row * 120 + column
+            if buf[offset] & mask:
+                raise ValueError('White refresh area is not white')
+            shown[offset] |= mask
+
+
 class ReaderDisplay:
     def __init__(self):
         self.panel = None
@@ -22,13 +39,13 @@ class ReaderDisplay:
         while not display.is_done_updating():
             await aio.sleep_ms(25)
 
-    def queue_frame(self, partial=False):
+    def queue_frame(self, partial=False, force_white_region=None):
         if self.busy:
             raise RuntimeError("PocketReader display is busy")
         self.busy = True
-        aio.create_task(self._show_frame(partial))
+        aio.create_task(self._show_frame(partial, force_white_region))
 
-    async def _show_frame(self, partial=False):
+    async def _show_frame(self, partial=False, force_white_region=None):
         try:
             if self.panel is None:
                 if not self.quick_boot:
@@ -53,6 +70,8 @@ class ReaderDisplay:
                 await self.panel.restart()
                 self.partial_mode = partial
             if partial:
+                if force_white_region is not None:
+                    _force_white_region(self.panel.buf, self.panel._shown, force_white_region)
                 await self.panel.show()
                 self.small_updates += 1
             else:
